@@ -60,7 +60,7 @@ export const siteConfig: SiteConfig = {
 	subtitle: "人心中的成见是一座大山",
 
 	// 站点 URL
-	site_url: "https://seasir.top",
+	site_url: "https://metaxora.com",
 
 	// 站点描述
 	description:
