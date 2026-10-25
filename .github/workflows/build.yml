@@ -67,7 +67,7 @@ jobs:
           name: blog-dist
           path: dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
   publish:
     name: Publish website

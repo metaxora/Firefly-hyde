@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -20,7 +21,74 @@ STATE = Path("/var/lib/metaxora-blog-deploy")
 TRUSTED_PUBLIC_KEY = Path("/etc/metaxora-blog-deploy/signing-public.pem")
 API = "https://api.github.com/repos/" + REPOSITORY
 MAX_DOWNLOAD = 80_000_000
+STALE_TEMP_SECONDS = 60 * 60
 RESERVED = {"panel", "status", "wb", "whale", ".well-known", "deployment-version.json"}
+
+
+def cleanup_stale(now=None):
+    """Called under the deployment lock, before any GitHub/network operation."""
+    now = time.time() if now is None else now
+    releases = BASE / "releases"
+    try:
+        if BASE.is_symlink() or STATE.is_symlink() or releases.is_symlink():
+            raise ValueError("Unexpected deployment root link")
+        current = (BASE / "current").resolve(strict=True)
+        state = json.loads((STATE / "state.json").read_text())
+        if not isinstance(state, dict) or not all(isinstance(state.get(field), str) and state[field] for field in ("release", "previous")):
+            raise ValueError("Unexpected deployment state")
+        protected = {current}
+        for field in ("release", "previous"):
+            if state.get(field):
+                protected.add(Path(state[field]).resolve())
+        if any(p.parent != releases for p in protected):
+            raise ValueError("Unexpected release reference")
+    except (OSError, ValueError, TypeError):
+        print("Skipping stale cleanup: release references could not be verified.", flush=True)
+        return []
+
+    def old_enough(path):
+        newest = path.lstat().st_mtime
+        if path.is_dir():
+            for child in path.rglob("*"):
+                info = child.lstat()
+                if stat.S_ISLNK(info.st_mode) or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                    return False
+                newest = max(newest, info.st_mtime)
+        return now - newest >= STALE_TEMP_SECONDS
+
+    candidates = []
+    for parent, pattern in [(STATE, r"download-[A-Za-z0-9_-]+"),
+                            (releases, r"\.staging-[A-Za-z0-9_-]+|auto-[0-9a-f]{12}-[0-9a-f]{10}")]:
+        candidates.extend(p for p in parent.iterdir() if re.fullmatch(pattern, p.name))
+    pending_state = STATE / "state.next.json"
+    if pending_state.exists() and not pending_state.is_symlink() and pending_state.is_file():
+        candidates.append(pending_state)
+    removed = []
+    for path in candidates:
+        try:
+            if path.is_symlink() or path.resolve() in protected or path.resolve().parent not in (STATE, releases):
+                continue
+            if not old_enough(path):
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.is_file() and path == pending_state:
+                path.unlink()
+            else:
+                continue
+            removed.append(str(path))
+            print("CLEANED stale deployment path: " + str(path), flush=True)
+        except OSError as error:
+            print("Stale cleanup will retry next check: " + str(error), flush=True)
+    pending_link = BASE / "current.next"
+    try:
+        if pending_link.is_symlink() and now - pending_link.lstat().st_mtime >= STALE_TEMP_SECONDS:
+            pending_link.unlink()
+            removed.append(str(pending_link))
+            print("CLEANED stale deployment link: " + str(pending_link), flush=True)
+    except OSError as error:
+        print("Pending link cleanup will retry next check: " + str(error), flush=True)
+    return removed
 
 
 def download(url, limit):
@@ -253,6 +321,7 @@ def main():
 
     with (STATE / "deploy.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        cleanup_stale()
         deploy()
 
 

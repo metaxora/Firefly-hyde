@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -137,6 +138,93 @@ class SignedManifestChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "replay"):
             pull.validate_release_order(manifest, {"workflow_run_id": 124, "workflow_run_attempt": 1})
         pull.validate_release_order(manifest, {"workflow_run_id": 123})
+
+
+@unittest.skipIf(os.name == "nt", "Server cleanup uses Linux deployment links and lock")
+class StaleCleanupChecks(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.root = Path(self.folder.name)
+        self.original_base, self.original_state = pull.BASE, pull.STATE
+        pull.BASE, pull.STATE = self.root / "website", self.root / "state"
+        self.releases = pull.BASE / "releases"
+        self.releases.mkdir(parents=True)
+        pull.STATE.mkdir()
+        self.current = self.releases / ("auto-" + "a" * 12 + "-" + "b" * 10)
+        self.previous = self.releases / ("auto-" + "c" * 12 + "-" + "d" * 10)
+        for path in (self.current, self.previous):
+            path.mkdir()
+            (path / "index.html").write_text("keep this release")
+        (pull.BASE / "current").symlink_to(self.current, target_is_directory=True)
+        self.state = {"release": str(self.current), "previous": str(self.previous)}
+        (pull.STATE / "state.json").write_text(json.dumps(self.state))
+        self.now = 2_000_000_000
+
+    def tearDown(self):
+        pull.BASE, pull.STATE = self.original_base, self.original_state
+        self.folder.cleanup()
+
+    def age(self, path, seconds=7200):
+        for child in list(path.rglob("*")) + [path] if path.is_dir() else [path]:
+            os.utime(child, (self.now - seconds, self.now - seconds), follow_symlinks=False)
+
+    def test_stale_download_stage_and_pending_files_are_removed(self):
+        download = pull.STATE / "download-old"
+        stage = self.releases / ".staging-old"
+        for path in (download, stage):
+            path.mkdir()
+            (path / "partial").write_text("old leftover")
+            self.age(path)
+        pending = pull.STATE / "state.next.json"
+        pending.write_text("{}"); self.age(pending)
+        link = pull.BASE / "current.next"
+        link.symlink_to(self.previous, target_is_directory=True); self.age(link)
+        recent = pull.STATE / "download-recent"
+        recent.mkdir(); self.age(recent, 3599)
+        removed = pull.cleanup_stale(self.now)
+        self.assertEqual(len(removed), 4)
+        self.assertTrue(recent.exists())
+        self.assertTrue(self.previous.exists())
+
+    def test_referenced_releases_unknown_paths_and_links_are_preserved(self):
+        orphan = self.releases / ("auto-" + "e" * 12 + "-" + "f" * 10)
+        unknown = self.releases / "manual-backup"
+        for path in (self.current, self.previous, orphan, unknown):
+            path.mkdir(exist_ok=True); self.age(path)
+        outside = self.root / "outside"
+        outside.mkdir(); (outside / "keep").write_text("untouched")
+        link = pull.STATE / "download-link"
+        link.symlink_to(outside, target_is_directory=True); self.age(link)
+        pull.cleanup_stale(self.now)
+        self.assertFalse(orphan.exists())
+        for path in (self.current, self.previous, unknown, outside / "keep", link):
+            self.assertTrue(path.exists())
+
+    def test_recent_child_protects_an_older_stage_directory(self):
+        stage = self.releases / ".staging-old-parent"
+        stage.mkdir(); (stage / "partial").write_text("recent write")
+        self.age(stage)
+        self.age(stage / "partial", 10)
+        pull.cleanup_stale(self.now)
+        self.assertTrue(stage.exists())
+
+    def test_cleanup_runs_even_when_network_check_fails(self):
+        stale = pull.STATE / "download-old"
+        stale.mkdir(); self.age(stale)
+        with mock.patch.object(pull.time, "time", return_value=self.now), mock.patch.object(pull, "deploy", side_effect=RuntimeError("network unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "network"):
+                pull.main()
+        self.assertFalse(stale.exists())
+        self.assertTrue((pull.STATE / "state.json").exists())
+
+    def test_unreadable_release_references_disable_deletion(self):
+        stale = self.releases / ".staging-old"
+        stale.mkdir(); self.age(stale)
+        for data in ("not valid json", "{}", json.dumps({"release": str(self.current), "previous": "/outside"})):
+            with self.subTest(data=data):
+                (pull.STATE / "state.json").write_text(data)
+                self.assertEqual(pull.cleanup_stale(self.now), [])
+                self.assertTrue(stale.exists())
 
 
 if __name__ == "__main__":
