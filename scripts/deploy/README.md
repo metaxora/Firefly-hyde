@@ -5,11 +5,23 @@
 ## 发布流程
 
 1. 提交 main 后，GitHub Actions 并行执行源代码检查和构建。
-2. 两个任务成功后，publish 任务将静态文件和逐文件 SHA-256 清单写入 `blog-deploy` 分支。此分支是自动生成的，不要手动编辑；每次发布替换分支头，只保留当前发布快照。
-3. zero 的 systemd timer 在上一次检查结束两分钟后再次检查，下载固定提交的快照，确认对应的 main 工作流已完成且成功，校验全部文件后切换 current。
+2. 两个任务成功后，publish 任务用专用 Ed25519 私钥签署逐文件 SHA-256 清单，将静态文件、清单及 `deployment.sig` 写入 `blog-deploy` 分支。此分支是自动生成的，不要手动编辑；每次发布替换分支头，只保留当前发布快照。
+3. zero 的 systemd timer 在上一次检查结束两分钟后再次检查，使用本机固定公钥验签，再确认对应 main 工作流成功、核对运行编号及重试次数、校验全部文件后切换 current。旧运行记录重放会被拒绝。
 4. 发布期间旧网站继续提供服务。新首页验证失败或原有面板、状态页、接口健康检查响应变化时自动恢复前一版。
 
 只有 publish 任务拥有仓库 `contents: write`；使用 GitHub 自动提供的临时 GITHUB_TOKEN。服务器访问公开 GitHub 不使用令牌，GitHub 不保存服务器 SSH 私钥。PR 构建不会发布。
+
+## 专用签名密钥
+
+- 私钥仅存于该仓库的 Actions Secret：`BLOG_SIGNING_PRIVATE_KEY`，只有发布任务使用。
+- 公钥在仓库 `scripts/deploy/signing-public.pem` 中公开，服务器信任副本固定在 `/etc/metaxora-blog-deploy/signing-public.pem`，由 root 管理。
+- 发布账号不能修改服务器信任的公钥；不会从发布分支自动更新公钥。
+- 这套密钥只用于文件签名，没有加入 SSH authorized_keys，不能用来登录服务器。
+- 签名算法为 Ed25519。私钥在发布时通过标准输入交给 OpenSSL，不写入工作区、发布分支或构建包。
+- 无私钥、无签名、签名错误、清单或文件被改动时拒绝发布，不会退回接受无签名文件的模式。
+- 更换密钥需要先配置新的 GitHub Secret 与服务器公钥并实测；从 GitHub 无法取回已有 Secret 的明文。如密钥丢失，应生成新的签名密钥并替换双方配置。
+
+签名保护发布文件不被仅有发布分支写权限者伪造。拥有足够权限修改 main 工作流并使用该 Secret 的人仍具有发布能力；GitHub 账号和授权工具的安全依然重要。
 
 ## 服务器安装
 
@@ -17,6 +29,7 @@
 
 - 系统账号：`blog-deploy`，禁止交互登录、无 sudo。
 - 程序：`/usr/local/lib/metaxora-blog-deploy/pull.py`，root 所有，服务账号不能修改。
+- 验签公钥：`/etc/metaxora-blog-deploy/signing-public.pem`，root 所有，文件权限 0644、目录权限 0755。
 - 服务和定时器：本目录同名 `.service`、`.timer` 安装到 `/etc/systemd/system/`。
 - 网站目录：`/var/www/metaxora-blog/`，授予 blog-deploy 写权限。
 - 状态：`/var/lib/metaxora-blog-deploy/state.json`，服务运行时创建，其他用户不可读。
@@ -60,4 +73,4 @@ sudo systemctl stop metaxora-blog-deploy.service
 python3 -B -m unittest discover -s scripts/deploy -p 'test_*.py' -v
 ```
 
-检查损坏构建包、路径穿越、占用现有路由的文件和健康检查失败时的回退。Linux CI 执行全部测试。
+检查正确签名、清单篡改、错误公钥、缺少签名、旧构建重放、损坏构建包、路径穿越、占用现有路由的文件和健康检查失败时的回退。Linux CI 执行全部测试。

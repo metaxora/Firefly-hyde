@@ -89,4 +89,5 @@ jobs:
       - name: Publish static release
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          BLOG_SIGNING_PRIVATE_KEY: ${{ secrets.BLOG_SIGNING_PRIVATE_KEY }}
         run: python3 -B scripts/deploy/publish.py

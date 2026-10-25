@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -40,6 +41,7 @@ class DeploymentChecks(unittest.TestCase):
         prefix = "Firefly-hyde-" + COMMIT + "/"
         with zipfile.ZipFile(result, "w") as z:
             z.writestr(prefix + "deployment.json", json.dumps(self.manifest))
+            z.writestr(prefix + "deployment.sig", b"s" * 64)
             for p in self.dist.rglob("*"):
                 if p.is_file():
                     z.writestr(prefix + "site/" + p.relative_to(self.dist).as_posix(),
@@ -89,6 +91,52 @@ class DeploymentChecks(unittest.TestCase):
             self.assertFalse((self.root / "current.next").exists())
         finally:
             pull.BASE = original_base
+
+
+class SignedManifestChecks(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.root = Path(self.folder.name)
+        self.private = subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519"], check=True, capture_output=True).stdout
+        public = subprocess.run(["openssl", "pkey", "-pubout"], input=self.private, check=True, capture_output=True).stdout
+        self.public = self.root / "public.pem"
+        self.public.write_bytes(public)
+        self.data = (json.dumps({"schema": 2, "repository": pull.REPOSITORY, "repository_id": 1432930314,
+                                "source_branch": "main", "source_commit": COMMIT, "workflow_run_id": 124,
+                                "workflow_run_attempt": 1,
+                                "files": {n: {"sha256": hashlib.sha256(b"test").hexdigest(), "size": 4}
+                                          for n in ["index.html", "404.html", "favicon/favicon.ico"]}}) + "\n").encode()
+        self.path = self.root / "manifest.json"
+        self.path.write_bytes(self.data)
+        self.signature = publish.sign_manifest(self.path, self.private.decode())
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def test_signed_manifest_is_accepted(self):
+        manifest = pull.verified_manifest(self.data, self.signature, self.public)
+        self.assertEqual(manifest["source_commit"], COMMIT)
+
+    def test_modified_manifest_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "signature"):
+            pull.verified_manifest(self.data.replace(b'"main"', b'"evil"'), self.signature, self.public)
+
+    def test_wrong_key_and_missing_signature_are_rejected(self):
+        other_private = subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519"], check=True, capture_output=True).stdout
+        other_public = subprocess.run(["openssl", "pkey", "-pubout"], input=other_private, check=True, capture_output=True).stdout
+        self.public.write_bytes(other_public)
+        with self.assertRaisesRegex(ValueError, "signature"):
+            pull.verified_manifest(self.data, self.signature, self.public)
+        with self.assertRaisesRegex(ValueError, "signature"):
+            pull.verified_manifest(self.data, b"", self.public)
+
+    def test_old_signed_build_is_rejected(self):
+        manifest = pull.verified_manifest(self.data, self.signature, self.public)
+        with self.assertRaisesRegex(ValueError, "replay"):
+            pull.validate_release_order(manifest, {"workflow_run_id": 125})
+        with self.assertRaisesRegex(ValueError, "replay"):
+            pull.validate_release_order(manifest, {"workflow_run_id": 124, "workflow_run_attempt": 1})
+        pull.validate_release_order(manifest, {"workflow_run_id": 123})
 
 
 if __name__ == "__main__":

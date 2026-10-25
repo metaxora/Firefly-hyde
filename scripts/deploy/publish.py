@@ -14,7 +14,7 @@ REPOSITORY = "metaxora/Firefly-hyde"
 BRANCH = "blog-deploy"
 
 
-def manifest_for(dist, source_commit, run_id):
+def manifest_for(dist, source_commit, run_id, run_attempt=1):
     files = {}
     for path in sorted(dist.rglob("*")):
         if path.is_symlink():
@@ -29,9 +29,19 @@ def manifest_for(dist, source_commit, run_id):
         raise ValueError("Incomplete website build")
     if sum(f["size"] for f in files.values()) > 200_000_000:
         raise ValueError("Website build exceeds deployment size limit")
-    return {"schema": 1, "repository": REPOSITORY, "source_branch": "main",
-            "source_commit": source_commit, "workflow_run_id": int(run_id),
+    return {"schema": 2, "repository": REPOSITORY, "repository_id": 1432930314, "source_branch": "main",
+            "source_commit": source_commit, "workflow_run_id": int(run_id), "workflow_run_attempt": int(run_attempt),
             "created_at": datetime.now(timezone.utc).isoformat(), "files": files}
+
+
+def sign_manifest(path, private_key):
+    if not private_key:
+        raise ValueError("BLOG_SIGNING_PRIVATE_KEY is required; unsigned publication is disabled")
+    signed = subprocess.run(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", "/dev/stdin", "-in", str(path)],
+                            input=private_key.encode(), capture_output=True)
+    if signed.returncode != 0 or len(signed.stdout) != 64:
+        raise ValueError("Ed25519 manifest signing failed")
+    return signed.stdout
 
 
 def main():
@@ -40,7 +50,8 @@ def main():
     source = os.environ["GITHUB_SHA"]
     if not re.fullmatch(r"[0-9a-f]{40}", source):
         raise ValueError("Invalid source commit")
-    manifest = manifest_for(Path("dist"), source, os.environ["GITHUB_RUN_ID"])
+    manifest = manifest_for(Path("dist"), source, os.environ["GITHUB_RUN_ID"], os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+    private_key = os.environ.pop("BLOG_SIGNING_PRIVATE_KEY", "")
     token = os.environ["GITHUB_TOKEN"]
     git_env = os.environ.copy()
     git_env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
@@ -50,7 +61,16 @@ def main():
     with tempfile.TemporaryDirectory(prefix="blog-publish-") as folder:
         root = Path(folder)
         shutil.copytree("dist", root / "site")
-        (root / "deployment.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        manifest_path = root / "deployment.json"
+        manifest_path.write_bytes((json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode())
+        signature_path = root / "deployment.sig"
+        signature_path.write_bytes(sign_manifest(manifest_path, private_key))
+        private_key = ""
+        verified = subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey",
+                                   str(Path(__file__).with_name("signing-public.pem").resolve()),
+                                   "-in", str(manifest_path), "-sigfile", str(signature_path)], capture_output=True)
+        if verified.returncode != 0:
+            raise ValueError("Signing key does not match the configured public key")
 
         def git(*args, authenticated=False):
             result = subprocess.run(["git", *args], cwd=root, env=git_env if authenticated else None,

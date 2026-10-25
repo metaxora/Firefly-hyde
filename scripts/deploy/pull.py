@@ -17,6 +17,7 @@ REPOSITORY = "metaxora/Firefly-hyde"
 BRANCH = "blog-deploy"
 BASE = Path("/var/www/metaxora-blog")
 STATE = Path("/var/lib/metaxora-blog-deploy")
+TRUSTED_PUBLIC_KEY = Path("/etc/metaxora-blog-deploy/signing-public.pem")
 API = "https://api.github.com/repos/" + REPOSITORY
 MAX_DOWNLOAD = 80_000_000
 RESERVED = {"panel", "status", "wb", "whale", ".well-known", "deployment-version.json"}
@@ -35,13 +36,42 @@ def json_at(url):
     return json.loads(download(url, 1_000_000))
 
 
+def verified_manifest(data, signature, public_key=None):
+    if len(signature) != 64:
+        raise ValueError("Missing or invalid Ed25519 signature")
+    key = public_key if public_key is not None else TRUSTED_PUBLIC_KEY
+    with tempfile.TemporaryDirectory(prefix="blog-verify-") as folder:
+        manifest_path = Path(folder) / "deployment.json"
+        signature_path = Path(folder) / "deployment.sig"
+        manifest_path.write_bytes(data)
+        signature_path.write_bytes(signature)
+        result = subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(key),
+                                 "-in", str(manifest_path), "-sigfile", str(signature_path)], capture_output=True)
+    if result.returncode != 0:
+        raise ValueError("Manifest signature verification failed")
+    manifest = json.loads(data)
+    validate_manifest(manifest)
+    return manifest
+
+
+def validate_release_order(manifest, applied):
+    if applied:
+        previous = (int(applied["workflow_run_id"]), int(applied.get("workflow_run_attempt", 1)))
+        candidate = (manifest["workflow_run_id"], manifest["workflow_run_attempt"])
+        if candidate <= previous:
+            raise ValueError("Refusing replay of an older or already deployed build")
+
+
 def validate_manifest(manifest):
-    if manifest.get("schema") != 1 or manifest.get("repository") != REPOSITORY or manifest.get("source_branch") != "main":
+    if (manifest.get("schema") != 2 or manifest.get("repository") != REPOSITORY
+            or manifest.get("repository_id") != 1432930314 or manifest.get("source_branch") != "main"):
         raise ValueError("Unexpected deployment manifest")
     if not re.fullmatch(r"[0-9a-f]{40}", manifest.get("source_commit", "")):
         raise ValueError("Invalid source commit")
     if not isinstance(manifest.get("workflow_run_id"), int) or manifest["workflow_run_id"] < 1:
         raise ValueError("Invalid workflow run")
+    if not isinstance(manifest.get("workflow_run_attempt"), int) or manifest["workflow_run_attempt"] < 1:
+        raise ValueError("Invalid workflow attempt")
     files = manifest.get("files", {})
     if not 3 <= len(files) <= 3000 or not {"index.html", "404.html", "favicon/favicon.ico"} <= files.keys():
         raise ValueError("Incomplete website manifest")
@@ -57,10 +87,11 @@ def validate_manifest(manifest):
         raise ValueError("Expanded website exceeds size limit")
 
 
-def extract_checked(archive, manifest, commit, target):
+def extract_checked(archive, manifest, commit, target, signature=None, manifest_bytes=None):
     validate_manifest(manifest)
     prefix = "Firefly-hyde-" + commit + "/"
     found = set()
+    controls = set()
     with zipfile.ZipFile(archive) as z:
         if len(z.infolist()) > 6000 or sum(e.file_size for e in z.infolist()) > 201_000_000:
             raise ValueError("Archive exceeds size limit")
@@ -75,8 +106,17 @@ def extract_checked(archive, manifest, commit, target):
                 continue
             relative = name[len(prefix):]
             if relative == "deployment.json":
+                if relative in controls or (manifest_bytes is not None and z.read(entry) != manifest_bytes):
+                    raise ValueError("Archive signed manifest mismatch")
                 if json.loads(z.read(entry)) != manifest:
                     raise ValueError("Archive manifest mismatch")
+                controls.add(relative)
+                continue
+            if relative == "deployment.sig":
+                actual_signature = z.read(entry)
+                if relative in controls or len(actual_signature) != 64 or (signature is not None and actual_signature != signature):
+                    raise ValueError("Archive signature mismatch")
+                controls.add(relative)
                 continue
             if not relative.startswith("site/"):
                 raise ValueError("Unexpected archive file")
@@ -94,6 +134,8 @@ def extract_checked(archive, manifest, commit, target):
             found.add(name)
     if found != manifest["files"].keys():
         raise ValueError("Archive is missing website files")
+    if controls != {"deployment.json", "deployment.sig"}:
+        raise ValueError("Archive is missing its signed manifest")
     for p in target.rglob("*"):
         if p.is_dir():
             p.chmod(0o755)
@@ -145,14 +187,18 @@ def deploy():
     if applied.get("deployment_commit") == commit:
         print("Current release is up to date: " + applied["source_commit"], flush=True)
         return
-    manifest = json_at("https://raw.githubusercontent.com/" + REPOSITORY + "/" + commit + "/deployment.json")
-    validate_manifest(manifest)
+    raw_base = "https://raw.githubusercontent.com/" + REPOSITORY + "/" + commit + "/"
+    manifest_data = download(raw_base + "deployment.json", 1_000_000)
+    signature = download(raw_base + "deployment.sig", 1024)
+    manifest = verified_manifest(manifest_data, signature)
+    validate_release_order(manifest, applied)
     run = json_at(API + "/actions/runs/" + str(manifest["workflow_run_id"]))
     if run.get("status") != "completed":
         print("Published workflow is still finishing; waiting for next check.", flush=True)
         return
     if (run.get("conclusion") != "success" or run.get("head_sha") != manifest["source_commit"]
             or run.get("head_branch") != "main" or run.get("event") not in ("push", "workflow_dispatch")
+            or run.get("run_attempt") != manifest["workflow_run_attempt"] or run.get("repository", {}).get("id") != 1432930314
             or run.get("path") != ".github/workflows/build.yml"):
         raise ValueError("Publication is not from a successful main build")
     releases = BASE / "releases"
@@ -166,9 +212,12 @@ def deploy():
         with tempfile.TemporaryDirectory(prefix="download-", dir=STATE) as folder:
             archive = Path(folder) / "website.zip"
             archive.write_bytes(download("https://codeload.github.com/" + REPOSITORY + "/zip/" + commit, MAX_DOWNLOAD))
-            extract_checked(archive, manifest, commit, stage)
+            extract_checked(archive, manifest, commit, stage, signature=signature, manifest_bytes=manifest_data)
         record = {"source_commit": manifest["source_commit"], "deployment_commit": commit,
-                  "workflow_run_id": manifest["workflow_run_id"], "deployed_at": datetime.now(timezone.utc).isoformat()}
+                  "workflow_run_id": manifest["workflow_run_id"], "workflow_run_attempt": manifest["workflow_run_attempt"],
+                  "signature_verified": True, "signature_algorithm": "Ed25519",
+                  "signing_key_id": hashlib.sha256(TRUSTED_PUBLIC_KEY.read_bytes()).hexdigest()[:8],
+                  "deployed_at": datetime.now(timezone.utc).isoformat()}
         (stage / "deployment-version.json").write_text(json.dumps(record, indent=2) + "\n")
         (stage / "deployment-version.json").chmod(0o644)
         if release.exists():
