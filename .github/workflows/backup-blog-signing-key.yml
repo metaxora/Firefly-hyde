@@ -1,0 +1,43 @@
+name: One-time encrypted signing-key backup
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    if: github.repository == 'metaxora/Firefly-hyde' && github.actor == 'metaxora' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Encrypt existing key for the owner's workstation
+        env:
+          SIGNING_PRIVATE_KEY: ${{ secrets.BLOG_SIGNING_PRIVATE_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          public = "-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEArPGUyQZPFS5KlHf1oLrM\nUXb5d34duyTgO8gTP06HquQ7XcnOLLwqZMe+iRfIyAeB9XerSpW/rWhJEsAFT9nb\nNiFYPLmODd3okobSUJaf+J+9ukPOCIbw36P1qOTaJxrm1vAfXrgMZ0DdT8wHiVkq\nt9sOCL0C4olU2GEmYExDwuAvP8gflPfNzo3PJNAcyoxNB+/5+q4L0jXDyFwzhYre\ngJvnKoRCBNBB0+fQehjQWHktuxMt0fwvBKves5/83q6JXUBaf8lKNdl3Z7VWBP3c\nFEtr7uzOnAm2Ke6E3gNMo1Xdue/YqQiUy0AZeDprFHRBzzNSpzUaG2Dk9NRU1QdM\nJ9ByMkQWG5n0ZeYNbOpa5lWXmQWJ4v1BJeJ5bq0WJ57AKn3Z5Q4PUsCoU+tAR5PD\n6w9mYlMD7y7t/4SMsaHtOWGu6wPO4MFFcRX4wrdLEg+SDpvhfkWnt3ul5enkaCpv\nk6y60mxIlJ2RIl1n46Ktvp27mwg1yaQrhiOoQlKWJvwxAgMBAAE=\n-----END PUBLIC KEY-----\n"
+          recipient = Path('recipient-public.pem')
+          recipient.write_text(public)
+          private = os.environ.pop('SIGNING_PRIVATE_KEY', '').encode()
+          if not private.startswith(b'-----BEGIN PRIVATE KEY-----') or len(private) > 300:
+              raise RuntimeError('Expected the configured Ed25519 signing key')
+          encrypted = subprocess.run(
+              ['openssl', 'pkeyutl', '-encrypt', '-pubin', '-inkey', str(recipient),
+               '-pkeyopt', 'rsa_padding_mode:oaep', '-pkeyopt', 'rsa_oaep_md:sha256',
+               '-pkeyopt', 'rsa_mgf1_md:sha256'],
+              input=private, capture_output=True, check=True).stdout
+          private = b''
+          if len(encrypted) != 384:
+              raise RuntimeError('Unexpected encrypted backup size')
+          Path('encrypted-backup').mkdir()
+          Path('encrypted-backup/signing-key.rsa-oaep').write_bytes(encrypted)
+          print('Encrypted backup prepared; no plaintext key file was created.')
+          PY
+      - name: Save encrypted backup
+        uses: actions/upload-artifact@v7
+        with:
+          name: owner-encrypted-signing-key-backup
+          path: encrypted-backup/
+          retention-days: 1
+          if-no-files-found: error
