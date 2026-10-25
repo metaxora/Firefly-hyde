@@ -1,21 +1,40 @@
 ---
 interface Props {
-	shareId: string;
-	shareApiBase: string;
+	clarityId?: string;
+	shareId?: string;
+	shareApiBase?: string;
 	historicalVisitors?: number;
 	historicalPageviews?: number;
 	localPreview?: boolean;
 }
 
 const {
-	shareId,
-	shareApiBase,
+	clarityId,
+	shareId = "",
+	shareApiBase = "",
 	historicalVisitors = 0,
 	historicalPageviews = 0,
 	localPreview = false,
 } = Astro.props;
 ---
 
+{clarityId && (
+<script is:inline data-swup-ignore-script define:vars={{ clarityId }}>
+	(() => {
+		if (document.querySelector("script[data-firefly-clarity]")) return;
+		window.clarity = window.clarity || function () {
+			(window.clarity.q = window.clarity.q || []).push(arguments);
+		};
+		const script = document.createElement("script");
+		script.async = true;
+		script.src = "https://www.clarity.ms/tag/" + encodeURIComponent(clarityId);
+		script.setAttribute("data-firefly-clarity", "");
+		document.head.appendChild(script);
+	})();
+</script>
+)}
+
+{shareId && shareApiBase && (
 <script is:inline define:vars={{ shareId, shareApiBase, historicalVisitors, historicalPageviews, localPreview }}>
 	(() => {
 		const namespace = "__rainztUmamiMetrics";
@@ -590,3 +609,4 @@ const {
 		}
 	})();
 </script>
+)}
