@@ -1,0 +1,32 @@
+[Unit]
+Description=Deploy successful metaxora blog builds from GitHub
+Wants=network-online.target
+After=network-online.target nginx.service
+
+[Service]
+Type=oneshot
+User=blog-deploy
+Group=blog-deploy
+ExecStart=/usr/bin/python3 -B /usr/local/lib/metaxora-blog-deploy/pull.py
+StateDirectory=metaxora-blog-deploy
+StateDirectoryMode=0700
+UMask=0022
+TimeoutStartSec=300
+Nice=10
+MemoryMax=256M
+CPUQuota=50%
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/www/metaxora-blog
+ProtectHome=true
+InaccessiblePaths=-/data
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+

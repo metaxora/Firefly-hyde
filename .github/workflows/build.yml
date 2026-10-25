@@ -33,6 +33,8 @@ jobs:
           run_install: false
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Check deployment scripts
+        run: python3 -B -m unittest discover -s scripts/deploy -p 'test_*.py' -v
       - name: Astro check
         run: pnpm check
       - name: TypeScript check
@@ -66,3 +68,25 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 7
+
+  publish:
+    name: Publish website
+    needs: [check, build]
+    if: github.repository == 'metaxora/Firefly-hyde' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download verified build
+        uses: actions/download-artifact@v8
+        with:
+          name: blog-dist
+          path: dist/
+      - name: Publish static release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/deploy/publish.py
