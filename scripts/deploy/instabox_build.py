@@ -1,74 +1,19 @@
-"""GitHub-side orchestrator; API credentials stay on this ephemeral runner."""
+"""GitHub orchestrates one public-repository build; artifacts use the file API."""
 import argparse
-import hashlib
-import io
 import json
 import os
 from pathlib import Path
-import re
-import shutil
 import signal
 import subprocess
 import tempfile
 import time
-import urllib.request
 import uuid
 
 import artifacts
-import pull
-from publish_instabox import expected_metadata, positive
+import build_config
+from instabox_api import Client
 
-SERVER = "https://api.instabox.sh"
-REMOTE_BASE = "/data/firefly-builds"
-
-
-def install_cli():
-    root = Path(os.environ["RUNNER_TEMP"]) / "instabox-bin"
-    root.mkdir(exist_ok=True)
-    url = SERVER + "/dl/instabox-linux-amd64"
-    with urllib.request.urlopen(url, timeout=60) as response:
-        expected = response.headers.get("X-Instabox-Sha256", "").strip()
-        data = response.read(100_000_001)
-    if not expected:
-        with urllib.request.urlopen(SERVER + "/dl/SHA256SUMS", timeout=30) as response:
-            lines = response.read(100_000).decode().splitlines()
-        matches = [line.split()[0] for line in lines if len(line.split()) == 2 and line.split()[1].lstrip("*") == "instabox-linux-amd64"]
-        expected = matches[0] if len(matches) == 1 else ""
-    if len(data) > 100_000_000 or not re.fullmatch(r"[0-9a-f]{64}", expected) or hashlib.sha256(data).hexdigest() != expected:
-        raise ValueError("Official CLI download checksum mismatch")
-    binary = root / "instabox"
-    binary.write_bytes(data)
-    binary.chmod(0o755)
-    subprocess.run([str(binary), "--version"], check=True)
-    with Path(os.environ["GITHUB_PATH"]).open("a") as stream:
-        stream.write(str(root) + "\n")
-    print("Verified CLI sha256: " + expected)
-
-
-def source_archive(root, target):
-    listing = subprocess.run(["git", "ls-tree", "-r", "-z", "HEAD"], cwd=root, check=True, capture_output=True).stdout
-    selected = []
-    for record in listing.split(b"\0"):
-        if not record:
-            continue
-        header, raw_name = record.split(b"\t", 1)
-        mode = header.split()[0]
-        name = raw_name.decode("utf-8")
-        parts = Path(name).parts
-        if (parts[0] in {".github", "docs", "Firefly-Docs", ".firefly-config-manager-backups"}
-                or any(p.startswith(".env") or p == ".git" for p in parts)
-                or Path(name).suffix.lower() in {".key", ".pem", ".p12", ".pfx", ".kdbx"}):
-            continue
-        if mode not in (b"100644", b"100755"):
-            raise ValueError("Source snapshot contains a link or submodule")
-        selected.append(name)
-    if not selected or len(selected) > 20_000:
-        raise ValueError("Invalid source snapshot size")
-    with target.open("wb") as stream:
-        subprocess.run(["git", "archive", "--format=tar", "HEAD", "--", *selected], cwd=root, check=True, stdout=stream)
-    if target.stat().st_size > 500_000_000:
-        raise ValueError("Source snapshot exceeds transfer limit")
-    return hashlib.sha256(target.read_bytes()).hexdigest()
+REMOTE_BASE = "/data/firefly-blog"
 
 
 def machine_state(info):
@@ -82,122 +27,121 @@ def machine_state(info):
     raise ValueError("InstaBox machine state was not returned")
 
 
+def validate_result(result, metadata):
+    if (not isinstance(result, dict) or result.get("status") != "success"
+            or type(result.get("exit_code")) is not int or result["exit_code"] != 0
+            or result.get("metadata") != metadata):
+        raise ValueError("Remote build failed or its identity does not match")
+    archive = result.get("archive", {})
+    if (not isinstance(archive, dict) or archive.get("name") != "dist.tar.gz"
+            or type(archive.get("size")) is not int or not 0 < archive["size"] <= artifacts.MAX_ARCHIVE):
+        raise ValueError("Invalid build archive descriptor")
+    import re
+    if not isinstance(archive.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", archive["sha256"]):
+        raise ValueError("Invalid build archive checksum")
+    return archive
+
+
+def ensure_running(client, deadline):
+    """Lifecycle calls return 202; do not execute before GET reports running."""
+    limit = min(deadline, time.monotonic() + 120)
+    wake_requested = False
+    while True:
+        state = machine_state(client.json("GET", ""))
+        if state == "running":
+            return
+        if state in ("paused", "suspended", "stopped"):
+            if not wake_requested:
+                operation = client.json("POST", "/start" if state == "stopped" else "/resume", {})
+                wake_requested = True
+                if operation.get("state") == "failed":
+                    raise RuntimeError("Machine start operation failed")
+        elif state not in ("starting", "resuming", "stopping", "suspending", "pausing"):
+            raise ValueError("Machine is not ready to build")
+        if time.monotonic() >= limit:
+            raise TimeoutError("Timed out waiting for the machine to run")
+        time.sleep(2)
+
+
 def build():
-    policy = pull.source_policy()
-    if (os.environ.get("GITHUB_REPOSITORY") != policy["source_repository"]
-            or os.environ.get("GITHUB_REPOSITORY_ID") != str(policy["source_repository_id"])
-            or os.environ.get("GITHUB_REF") != "refs/heads/main"
-            or os.environ.get("GITHUB_EVENT_NAME") not in ("push", "workflow_dispatch")):
-        raise ValueError("Build requires trusted private main")
-    source = os.environ["GITHUB_SHA"]
-    if not re.fullmatch(r"[0-9a-f]{40}", source):
-        raise ValueError("Invalid source commit")
+    metadata = build_config.workflow_metadata()
     actual = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-    if source != actual:
+    if metadata["source_commit"] != actual:
         raise ValueError("Checked-out source does not match workflow")
-    run_id, attempt = positive(os.environ["GITHUB_RUN_ID"]), positive(os.environ["GITHUB_RUN_ATTEMPT"])
-    metadata = expected_metadata(policy, source, run_id, attempt)
-    machine = policy["machine_id"]
-    if not re.fullmatch(r"m_[a-z0-9]+", machine):
-        raise ValueError("Invalid machine ID")
-    job = f"{run_id}-{attempt}"
-    remote = REMOTE_BASE + "/jobs/" + job
-    driver = remote + "/remote_build.py"
     credential = os.environ.get("INSTABOX_API_KEY", "")
     if not credential:
         raise ValueError("INSTABOX_API_KEY is not configured")
-    # Do not inherit GitHub tokens into the InstaBox CLI or any remote command.
-    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR") if k in os.environ}
-    env.update({"INSTABOX_API_KEY": credential, "INSTABOX_API_URL": SERVER})
-    cli = shutil.which("instabox")
-    if cli is None:
-        raise ValueError("Verified InstaBox CLI is not installed")
+    client = Client(metadata["machine_id"], credential)
+    job = f"{metadata['build_run_id']}-{metadata['build_run_attempt']}"
+    remote = REMOTE_BASE + "/jobs/" + job
+    driver = remote + "/remote_build.py"
     started = time.monotonic()
     deadline = started + 28 * 60
 
-    def run(*args, timeout=120):
+    def execute(*argv, timeout=60):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("InstaBox build deadline exceeded")
-        result = subprocess.run([cli, *args], env=env, capture_output=True, text=True, timeout=min(timeout, remaining))
-        if result.returncode:
-            raise RuntimeError("InstaBox operation failed: " + args[0])
-        return result.stdout
+        return client.execute(list(argv), timeout=max(1, min(timeout, int(remaining))))
 
-    def execute(*argv, timeout=60):
-        result = json.loads(run("exec", machine, "--timeout", str(timeout), "--json", "--", *argv, timeout=timeout + 30))
-        if result.get("exitCode") != 0 or result.get("timedOut") or result.get("truncated"):
-            raise RuntimeError("Remote command failed")
-        return result.get("stdout", "")
-
-    info = json.loads(run("get", machine, "--json"))
-    state = machine_state(info)
-    if state in ("paused", "suspended"):
-        run("resume", machine)
-    elif state == "stopped":
-        run("start", machine)
-    elif state != "running":
-        raise ValueError("Machine is not ready to build")
+    ensure_running(client, deadline)
     prepare = ("from pathlib import Path; import os; os.umask(0o077); "
                f"base=Path('{REMOTE_BASE}'); jobs=base/'jobs'; job=jobs/'{job}'; "
                "assert not any(p.is_symlink() for p in (base,jobs,job)); "
                "jobs.mkdir(parents=True,exist_ok=True); job.mkdir()")
     execute("python3", "-c", prepare)
-    launched = False
     driver_uploaded = False
+    launched = False
     try:
-        with tempfile.TemporaryDirectory(prefix="firefly-source-", dir=os.environ["RUNNER_TEMP"]) as folder:
-            snapshot = Path(folder) / "source.tar"
-            source_hash = source_archive(Path.cwd(), snapshot)
-            run("cp", str(snapshot), machine + ":" + remote + "/source.tar", timeout=180)
-            run("cp", str(Path(__file__).with_name("remote_build.py").resolve()), machine + ":" + driver)
-            driver_uploaded = True
-            execute("python3", driver, "start", job, source_hash, json.dumps(metadata))
-            launched = True
-            while True:
-                result = json.loads(execute("python3", driver, "status", job))
-                if result.get("status") != "running":
-                    break
-                if time.monotonic() >= deadline - 60:
-                    raise TimeoutError("InstaBox build deadline exceeded")
-                time.sleep(10)
-            marker = uuid.uuid4().hex
-            print("::stop-commands::" + marker, flush=True)
-            try:
-                print(execute("python3", driver, "log", job), flush=True)
-            finally:
-                print("::" + marker + "::", flush=True)
-            if result.get("status") != "success" or result.get("exit_code") != 0:
-                raise RuntimeError("InstaBox build did not succeed")
-            output = Path(os.environ["RUNNER_TEMP"]) / "firefly-output"
-            output.mkdir()
-            payload = output / "website.zip"
-            run("cp", machine + ":" + remote + "/website.zip", str(payload), timeout=180)
-            with tempfile.TemporaryDirectory(prefix="firefly-inspect-") as check:
-                artifacts.unpack_payload(payload, Path(check), metadata)
-            print("Build completed in " + str(round(time.monotonic() - started, 2)) + " seconds", flush=True)
+        client.upload(driver, Path(__file__).with_name("remote_build.py").read_bytes())
+        driver_uploaded = True
+        execute("python3", driver, "start", job, json.dumps(metadata))
+        launched = True
+        while True:
+            result = json.loads(execute("python3", driver, "status", job))
+            if result.get("status") != "running":
+                break
+            if time.monotonic() >= deadline - 180:
+                raise TimeoutError("Build exceeded its transfer-safe deadline")
+            time.sleep(10)
+        marker = uuid.uuid4().hex
+        print("::stop-commands::" + marker, flush=True)
+        try:
+            print(execute("python3", driver, "log", job), flush=True)
+        finally:
+            print("::" + marker + "::", flush=True)
+        archive = validate_result(result, metadata)
+        output = Path(os.environ["RUNNER_TEMP"]) / "firefly-output"
+        output.mkdir()
+        payload = output / "dist.tar.gz"
+        try:
+            client.download(remote + "/dist.tar.gz", payload, archive["size"], archive["sha256"], artifacts.MAX_ARCHIVE)
+            with tempfile.TemporaryDirectory(prefix="firefly-inspect-", dir=os.environ["RUNNER_TEMP"]) as folder:
+                artifacts.unpack_payload(payload, Path(folder), metadata)
+        except BaseException:
+            payload.unlink(missing_ok=True)
+            raise
+        payload_digest = artifacts.digest(payload)
+        with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+            stream.write("payload_digest=" + payload_digest + "\n")
+        print("Build and validated file download completed in " + str(round(time.monotonic() - started, 2)) + " seconds", flush=True)
+        return payload
     finally:
-        # A cancelled runner may have little time left. The remote 24-minute
-        # process-group timeout remains the independent upper bound.
+        # The remote process-group timeout remains effective after runner loss.
         if driver_uploaded:
             for action in (["cancel", "cleanup"] if launched else ["cleanup"]):
                 try:
-                    result = subprocess.run([cli, "exec", machine, "--timeout", "30", "--", "python3", driver, action, job],
-                                            env=env, capture_output=True, timeout=40)
-                    if result.returncode:
-                        print("Remote cleanup deferred to next build", flush=True)
-                except (OSError, subprocess.TimeoutExpired):
-                    print("Remote cleanup deferred to next build", flush=True)
+                    client.execute(["python3", driver, action, job], timeout=30)
+                except Exception:
+                    print("Remote cleanup deferred to a later build", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("install-cli", "build"))
-    args = parser.parse_args()
-    if args.action == "install-cli":
-        install_cli()
-    else:
-        def cancelled(signum, frame):
-            raise KeyboardInterrupt("Build cancelled")
-        signal.signal(signal.SIGTERM, cancelled)
-        build()
+    parser.add_argument("action", choices=("build",), nargs="?", default="build")
+    parser.parse_args()
+
+    def cancelled(signum, frame):
+        raise KeyboardInterrupt("Build cancelled")
+    signal.signal(signal.SIGTERM, cancelled)
+    build()

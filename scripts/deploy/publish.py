@@ -10,8 +10,12 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import build_config
+import pull
+
 REPOSITORY = "metaxora/Firefly-hyde"
 BRANCH = "blog-deploy"
+PUBLIC_KEY = Path(__file__).with_name("signing-public.pem")
 
 
 def manifest_for(dist, source_commit, run_id, run_attempt=1):
@@ -45,11 +49,11 @@ def sign_manifest(path, private_key):
 
 
 def main():
-    if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY or os.environ.get("GITHUB_REF") != "refs/heads/main":
-        raise ValueError("Publishing is restricted to this repository's main branch")
-    source = os.environ["GITHUB_SHA"]
-    if not re.fullmatch(r"[0-9a-f]{40}", source):
-        raise ValueError("Invalid source commit")
+    context = build_config.workflow_metadata()
+    source = context["source_commit"]
+    publish_flag = os.environ.get("RELEASE_PUBLISH", "false")
+    if publish_flag not in ("true", "false"):
+        raise ValueError("Invalid publication flag")
     manifest = manifest_for(Path("dist"), source, os.environ["GITHUB_RUN_ID"], os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
     private_key = os.environ.pop("BLOG_SIGNING_PRIVATE_KEY", "")
     token = os.environ["GITHUB_TOKEN"]
@@ -67,7 +71,7 @@ def main():
         signature_path.write_bytes(sign_manifest(manifest_path, private_key))
         private_key = ""
         verified = subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey",
-                                   str(Path(__file__).with_name("signing-public.pem").resolve()),
+                                   str(PUBLIC_KEY.resolve()),
                                    "-in", str(manifest_path), "-sigfile", str(signature_path)], capture_output=True)
         if verified.returncode != 0:
             raise ValueError("Signing key does not match the configured public key")
@@ -78,10 +82,38 @@ def main():
             return result.stdout.strip()
 
         git("init", "--quiet", "--initial-branch=" + BRANCH)
-        git("config", "user.name", "github-actions[bot]")
-        git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+        git("config", "user.name", "metaxora")
+        git("config", "user.email", "127007016+metaxora@users.noreply.github.com")
+        git("config", "core.fsmonitor", "false")
+        git("config", "core.hooksPath", "/dev/null")
+        git("config", "commit.gpgsign", "false")
         git("add", "--all")
         git("commit", "--quiet", "-m", "deploy: " + source)
+        # Check the precise ZIP layout with the original zero-side parser.
+        release_commit = git("rev-parse", "HEAD")
+        archive = root.parent / (root.name + ".zip")
+        if archive.exists() or archive.is_symlink():
+            raise ValueError("Release archive destination is not fresh")
+        try:
+            git("archive", "--format=zip", "--prefix=Firefly-hyde-" + release_commit + "/", "--output=" + str(archive), "HEAD")
+            if archive.stat().st_size > pull.MAX_DOWNLOAD:
+                raise ValueError("Release exceeds zero's download size limit")
+            original_manifest = pull.verified_manifest(manifest_path.read_bytes(), signature_path.read_bytes(), PUBLIC_KEY)
+            checked = root / "verified-site"
+            checked.mkdir()
+            pull.extract_checked(archive, original_manifest, release_commit, checked,
+                                 signature=signature_path.read_bytes(), manifest_bytes=manifest_path.read_bytes())
+            if publish_flag == "false":
+                preview = Path(os.environ["RUNNER_TEMP"]) / "firefly-preview"
+                preview.mkdir()
+                shutil.copyfile(archive, preview / "release.zip")
+                (preview / "release-info.json").write_text(json.dumps({"schema": 2, "source_commit": source,
+                    "release_commit": release_commit, "workflow_run_id": manifest["workflow_run_id"],
+                    "workflow_run_attempt": manifest["workflow_run_attempt"]}, indent=2) + "\n")
+                print("Signed preview verified; no remote branch was updated.")
+                return
+        finally:
+            archive.unlink(missing_ok=True)
         head = git("ls-remote", url, "refs/heads/main", authenticated=True).split()[0]
         if head != source:
             print("A newer main commit exists; skip this older build.")

@@ -1,330 +1,85 @@
-"""Protocol boundaries, provenance, private artifacts and lifecycle failure tests."""
-import copy
+"""Single-repository identity, remote lifecycle and unchanged zero compatibility."""
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
-import stat
+import shutil
 import subprocess
-import tarfile
 import tempfile
 import unittest
 from unittest import mock
 import zipfile
 
 import artifacts
-import github_api
+import build_config
 import instabox_build
+import prepare_build
 import publish
-import publish_instabox as signer
 import pull
 import remote_build
 
 SHA = "a" * 40
-POLICY = {"source_repository": "metaxora/blog-source", "source_repository_id": 123456789,
-          "build_workflow_path": ".github/workflows/instabox-build.yml",
-          "publisher_workflow_path": ".github/workflows/instabox-publish.yml",
-          "machine_id": "m_test", "node_version": "22.23.3", "pnpm_version": "11.22.0"}
+CONFIG = {"repository": "metaxora/Firefly-hyde", "repository_id": 1432930314,
+          "workflow_path": ".github/workflows/build.yml", "machine_id": "m_test",
+          "node_version": "22.23.3", "pnpm_version": "11.22.0"}
+METADATA = build_config.metadata(CONFIG, SHA, 300, 1)
 
 
-def manifest():
-    return {"schema": 3, "repository": pull.REPOSITORY, "repository_id": 1432930314,
-            "source_branch": "main", "source_commit": SHA, "workflow_run_id": 400,
-            "workflow_run_attempt": 1, "source_repository": POLICY["source_repository"],
-            "source_repository_id": POLICY["source_repository_id"], "build_run_id": 300,
-            "build_run_attempt": 1, "build_workflow_path": POLICY["build_workflow_path"],
-            "publisher_workflow_path": POLICY["publisher_workflow_path"], "publisher_commit": "b" * 40,
-            "artifact_id": 200, "artifact_digest": "sha256:" + "c" * 64, "channel": "candidate",
-            "files": {name: {"sha256": hashlib.sha256(b"file").hexdigest(), "size": 4}
-                      for name in ("index.html", "404.html", "favicon/favicon.ico")}}
+def environment(root):
+    return {"GITHUB_REPOSITORY": CONFIG["repository"], "GITHUB_REPOSITORY_ID": "1432930314",
+            "GITHUB_WORKFLOW_REF": CONFIG["repository"] + "/" + CONFIG["workflow_path"] + "@refs/heads/main",
+            "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_SHA": SHA, "GITHUB_RUN_ID": "300", "GITHUB_RUN_ATTEMPT": "1",
+            "RUNNER_TEMP": str(root), "GITHUB_OUTPUT": str(root / "github-output"),
+            "INSTABOX_API_KEY": "test-api", "GITHUB_TOKEN": "test-github-token",
+            "BLOG_SIGNING_PRIVATE_KEY": "must-not-reach-build"}
 
 
-class ProvenanceChecks(unittest.TestCase):
-    def setUp(self):
-        self.policy = mock.patch.object(pull, "source_policy", return_value=POLICY)
-        self.policy.start()
-        self.addCleanup(self.policy.stop)
-
-    def test_valid_v3_and_legacy_migration(self):
-        value = manifest()
-        pull.validate_manifest(value)
-        pull.validate_release_order(value, {"workflow_run_id": 399, "workflow_run_attempt": 1})
-
-    def test_wrong_private_repository_and_workflow_are_rejected(self):
-        for field, value in (("source_repository", "evil/source"), ("source_repository_id", True),
-                             ("build_workflow_path", ".github/workflows/pr.yml"),
-                             ("publisher_workflow_path", ".github/workflows/evil.yml"),
-                             ("artifact_digest", "a" * 64), ("publisher_commit", "main"),
-                             ("build_run_id", True), ("channel", "other")):
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                pull.validate_manifest(dict(manifest(), **{field: value}))
-
-    def test_source_replay_and_protocol_downgrade_are_rejected(self):
-        previous = dict(manifest(), workflow_run_id=399, minimum_schema=3)
-        with self.assertRaisesRegex(ValueError, "source build"):
-            pull.validate_release_order(manifest(), previous)
-        legacy = dict(manifest(), schema=2)
-        with self.assertRaisesRegex(ValueError, "downgrade"):
-            pull.validate_release_order(legacy, previous)
-        pull.validate_release_order(dict(manifest(), build_run_attempt=2), previous)
-
-    def test_publisher_commit_is_separate_from_private_source_commit(self):
-        value = manifest()
-        run = {"id": 400, "status": "completed", "conclusion": "success", "head_sha": "b" * 40,
-               "head_branch": "main", "event": "workflow_dispatch", "run_attempt": 1,
-               "repository": {"id": 1432930314}, "path": POLICY["publisher_workflow_path"]}
-        pull.validate_workflow(value, run)
-        for field, wrong in (("head_sha", SHA), ("conclusion", "failure"), ("event", "pull_request"),
-                             ("path", ".github/workflows/build.yml"), ("run_attempt", 2), ("id", 401)):
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                pull.validate_workflow(value, dict(run, **{field: wrong}))
-
-    def test_unconfigured_repository_policy_fails_closed(self):
-        with mock.patch.object(Path, "read_text", return_value=json.dumps(dict(POLICY, source_repository_id=None))):
-            with self.assertRaisesRegex(ValueError, "not configured"):
-                self.policy.stop()
-                try:
-                    pull.source_policy()
-                finally:
-                    self.policy.start()
+def site_fixture(root):
+    (root / "favicon").mkdir(parents=True)
+    for name in ("index.html", "404.html", "favicon/favicon.ico"):
+        (root / name).write_bytes(b"file")
 
 
-class BuildIdentityChecks(unittest.TestCase):
-    def setUp(self):
-        self.run = {"id": 300, "run_attempt": 1, "status": "completed", "conclusion": "success",
-                    "repository": {"id": 123456789}, "head_repository": {"id": 123456789},
-                    "head_branch": "main", "event": "push", "path": POLICY["build_workflow_path"], "head_sha": SHA}
-        self.artifact = {"id": 200, "expired": False, "name": "blog-dist-300-1", "size_in_bytes": 100,
-                         "digest": "sha256:" + "c" * 64, "workflow_run": {"id": 300,
-                             "repository_id": 123456789, "head_repository_id": 123456789,
-                             "head_branch": "main", "head_sha": SHA}}
+class SingleRepositoryChecks(unittest.TestCase):
+    def test_checked_in_repository_policy_is_complete(self):
+        config = build_config.load()
+        self.assertEqual(config["repository"], "metaxora/Firefly-hyde")
+        self.assertEqual(config["repository_id"], 1432930314)
+        self.assertEqual(config["workflow_path"], ".github/workflows/build.yml")
+        public = Path(__file__).with_name("signing-public.pem").read_bytes().replace(b"\r\n", b"\n")
+        self.assertEqual(hashlib.sha256(public).hexdigest(), "f607ca4303c9f5f110fd872d37c5a0bb6beed1545d6553774c683add31bfc5bc")
 
-    def validate(self, run=None, artifact=None, sha=SHA):
-        signer.validate_build(POLICY, self.run if run is None else run,
-                              self.artifact if artifact is None else artifact, 300, 1, 200, sha)
+    def test_zero_deployment_program_is_identical_to_verified_baseline(self):
+        data = Path(pull.__file__).read_bytes().replace(b"\r\n", b"\n")
+        git_blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        self.assertEqual(git_blob, "759ae7c9e5a228e902b35ad12a696090013487d3")
 
-    def test_valid_completed_build(self):
-        self.validate()
-
-    def test_failed_running_pr_wrong_attempt_and_obsolete_builds(self):
-        for field, value in (("conclusion", "failure"), ("status", "in_progress"), ("event", "pull_request"),
-                             ("head_repository", {"id": 999}), ("run_attempt", 2), ("head_sha", "d" * 40)):
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                self.validate(run=dict(self.run, **{field: value}))
-        with self.assertRaises(ValueError):
-            self.validate(sha="e" * 40)
-
-    def test_wrong_expired_or_renamed_artifact(self):
-        for field, value in (("id", 999), ("expired", True), ("digest", "missing"),
-                             ("name", "blog-dist-300-2"), ("size_in_bytes", 80_100_001),
-                             ("workflow_run", {"id": 299})):
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                self.validate(artifact=dict(self.artifact, **{field: value}))
-
-
-@unittest.skipIf(os.name == "nt", "Signing uses Linux /dev/stdin")
-class SignedV3Checks(unittest.TestCase):
-    def test_real_ed25519_v3_signature_binds_source_and_publisher(self):
-        with tempfile.TemporaryDirectory() as folder, mock.patch.object(pull, "source_policy", return_value=POLICY):
-            root = Path(folder)
-            private = subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519"], check=True, capture_output=True).stdout
-            public = subprocess.run(["openssl", "pkey", "-pubout"], input=private, check=True, capture_output=True).stdout
-            key = root / "public.pem"
-            key.write_bytes(public)
-            data = json.dumps(manifest(), sort_keys=True).encode()
-            path = root / "manifest.json"
-            path.write_bytes(data)
-            signature = publish.sign_manifest(path, private.decode())
-            self.assertEqual(len(signature), 64)
-            self.assertEqual(pull.verified_manifest(data, signature, key)["source_commit"], SHA)
-            with self.assertRaisesRegex(ValueError, "signature"):
-                pull.verified_manifest(data.replace(SHA.encode(), ("e" * 40).encode()), signature, key)
-
-
-class ArtifactPrivacyChecks(unittest.TestCase):
-    def setUp(self):
-        self.folder = tempfile.TemporaryDirectory()
-        self.addCleanup(self.folder.cleanup)
-        self.root = Path(self.folder.name)
-        self.dist = self.root / "dist"
-        (self.dist / "favicon").mkdir(parents=True)
-        for name in ("index.html", "404.html", "favicon/favicon.ico"):
-            (self.dist / name).write_bytes(b"file")
-        self.metadata = signer.expected_metadata(POLICY, SHA, 300, 1)
-
-    def envelope(self, payload):
-        outer = io.BytesIO()
-        with zipfile.ZipFile(outer, "w") as z:
-            z.writestr("website.zip", payload)
-        data = outer.getvalue()
-        return data, "sha256:" + hashlib.sha256(data).hexdigest()
-
-    def test_debug_maps_are_removed_without_changing_runtime_code(self):
-        (self.dist / "pio").mkdir()
-        (self.dist / "pio/README.md").write_text("asset documentation")
-        (self.dist / "app.js.map").write_text('{"sourcesContent":["private source"]}')
-        (self.dist / "app.js").write_bytes(b"const answer = 42;\n//# sourceMappingURL=app.js.map\n")
-        (self.dist / "style.css").write_bytes(b"body {color: red}\n/*# sourceMappingURL=style.css.map */\n")
-        self.assertEqual(artifacts.sanitize_distribution(self.dist), 2)
-        self.assertEqual((self.dist / "app.js").read_bytes(), b"const answer = 42;\n")
-        self.assertEqual((self.dist / "style.css").read_bytes(), b"body {color: red}")
-        artifacts.pack(self.dist, self.root / "website.zip", self.metadata)
-
-    def test_sanitizing_does_not_silently_publish_other_source_files(self):
-        (self.dist / "private.md").write_text("private draft")
-        artifacts.sanitize_distribution(self.dist)
-        self.assertTrue((self.dist / "private.md").exists())
-        with self.assertRaisesRegex(ValueError, "Source file"):
-            artifacts.pack(self.dist, self.root / "website.zip", self.metadata)
-
-    def test_private_payload_round_trip_and_digest(self):
-        payload = self.root / "website.zip"
-        artifacts.pack(self.dist, payload, self.metadata)
-        data, digest = self.envelope(payload.read_bytes())
-        target = self.root / "checked"
-        signer.receive(data, digest, target, self.metadata)
-        self.assertEqual((target / "index.html").read_bytes(), b"file")
-        with self.assertRaisesRegex(ValueError, "digest"):
-            signer.receive(data + b"bad", digest, self.root / "bad", self.metadata)
-
-    def test_source_files_routes_maps_and_credentials_are_rejected(self):
-        for name in ("../escape", "/absolute", "C:/escape", "panel/index.html", "status/a", "wb/a", "whale/a",
-                     "x/../../escape", "a/./b", "src/article.html", "file.map", "article.md", ".env", "key.pem"):
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                artifacts.safe_name(name)
-        for data in (b"-----BEGIN PRIVATE KEY-----", b"github_pat_" + b"x" * 40,
-                     b"//# sourceMappingURL=data:application/json;base64,abcd"):
-            with self.subTest(data_type=len(data)), self.assertRaises(ValueError):
-                artifacts.check_bytes("app.js", data)
-
-    def test_metadata_mismatch_and_unexpected_payload_files(self):
-        payload = self.root / "website.zip"
-        artifacts.pack(self.dist, payload, dict(self.metadata, source_commit="d" * 40))
-        with self.assertRaisesRegex(ValueError, "metadata"):
-            artifacts.unpack_payload(payload, self.root / "bad", self.metadata)
-        with zipfile.ZipFile(payload, "a") as z:
-            z.writestr(".git/config", "private")
-        with self.assertRaises(ValueError):
-            artifacts.unpack_payload(payload, self.root / "bad", dict(self.metadata, source_commit="d" * 40))
-
-    def test_symlink_duplicate_and_size_limits(self):
-        for kind in ("link", "duplicate", "large"):
-            stream = io.BytesIO()
-            with zipfile.ZipFile(stream, "w") as z:
-                entry = zipfile.ZipInfo("site/index.html")
-                if kind == "link":
-                    entry.external_attr = (stat.S_IFLNK | 0o777) << 16
-                z.writestr(entry, b"a")
-                if kind == "duplicate":
-                    import warnings
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        z.writestr("site/index.html", b"b")
-            stream.seek(0)
-            with zipfile.ZipFile(stream) as z:
-                if kind == "large":
-                    z.infolist()[0].file_size = artifacts.MAX_EXPANDED + 100_001
-                with self.subTest(kind=kind), self.assertRaises(ValueError):
-                    list(artifacts.checked_entries(z))
-
-
-class ReadOnlyChecks(unittest.TestCase):
-    def test_candidate_requires_verification_mode(self):
-        with self.assertRaisesRegex(ValueError, "read-only"):
-            pull.deploy("blog-deploy-candidate")
-
-    def test_candidate_verification_does_not_activate_or_write_state(self):
-        value = manifest()
-        serialized = json.dumps(value).encode()
-        ref = "d" * 40
-        archive = io.BytesIO()
-        with zipfile.ZipFile(archive, "w") as z:
-            prefix = "Firefly-hyde-" + ref + "/"
-            z.writestr(prefix + "deployment.json", serialized)
-            z.writestr(prefix + "deployment.sig", b"s" * 64)
-            for name in value["files"]:
-                z.writestr(prefix + "site/" + name, b"file")
-        run = {"id": 400, "status": "completed", "conclusion": "success", "head_sha": "b" * 40,
-               "head_branch": "main", "event": "workflow_dispatch", "run_attempt": 1,
-               "repository": {"id": 1432930314}, "path": POLICY["publisher_workflow_path"]}
-        with tempfile.TemporaryDirectory() as folder:
-            state = Path(folder)
-            before = b'{"workflow_run_id":399}'
-            (state / "state.json").write_bytes(before)
-            with mock.patch.object(pull, "STATE", state), mock.patch.object(pull, "source_policy", return_value=POLICY), \
-                    mock.patch.object(pull, "json_at", side_effect=[{"object": {"sha": ref}}, run]), \
-                    mock.patch.object(pull, "download", side_effect=[serialized, b"s" * 64, archive.getvalue()]), \
-                    mock.patch.object(pull, "verified_manifest", return_value=value), mock.patch.object(pull, "activate") as activate:
-                pull.deploy("blog-deploy-candidate", verify_only=True, expected_commit=ref)
-                activate.assert_not_called()
-            self.assertEqual((state / "state.json").read_bytes(), before)
-            self.assertEqual(sorted(p.name for p in state.iterdir()), ["state.json"])
-
-
-class SourceSnapshotChecks(unittest.TestCase):
-    def test_snapshot_excludes_tracked_secrets_and_workflow_files(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder) / "repo"
-            root.mkdir()
-            for name in ("package.json", "public/index.html", ".env", ".env.production", "private.key", "private.pem", ".github/workflows/test.yml"):
-                path = root / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("fixture")
-            def git(*args):
-                subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-                                "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", *args],
-                               cwd=root, check=True, capture_output=True)
-            git("init", "--quiet")
-            git("add", "--all")
-            git("commit", "--quiet", "-m", "fixture")
-            archive = Path(folder) / "source.tar"
-            checksum = instabox_build.source_archive(root, archive)
-            self.assertEqual(checksum, hashlib.sha256(archive.read_bytes()).hexdigest())
-            with tarfile.open(archive) as tar:
-                files = {entry.name for entry in tar if entry.isfile()}
-            self.assertEqual(files, {"package.json", "public/index.html"})
-
-    def test_tar_escape_links_wrong_hash_and_environment_files(self):
-        for kind in ("escape", "link", "environment", "digest"):
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder:
-                root = Path(folder)
-                path = root / "source.tar"
-                with tarfile.open(path, "w") as tar:
-                    entry = tarfile.TarInfo({"escape": "../outside", "link": "link", "environment": ".env", "digest": "file"}[kind])
-                    if kind == "link":
-                        entry.type = tarfile.SYMTYPE
-                        entry.linkname = "/outside"
-                        tar.addfile(entry)
-                    else:
-                        entry.size = 1
-                        tar.addfile(entry, io.BytesIO(b"x"))
-                expected = "0" * 64 if kind == "digest" else hashlib.sha256(path.read_bytes()).hexdigest()
-                with self.assertRaises(ValueError):
-                    remote_build.extract_source(path, root / "source", expected)
-                self.assertFalse((root / "outside").exists())
-
-    def test_valid_source_tar(self):
+    def test_wrong_repository_pr_branch_and_workflow_fail_before_remote_access(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            path = root / "source.tar"
-            with tarfile.open(path, "w") as tar:
-                entry = tarfile.TarInfo("package.json")
-                entry.size = 2
-                tar.addfile(entry, io.BytesIO(b"{}"))
-            remote_build.extract_source(path, root / "source", hashlib.sha256(path.read_bytes()).hexdigest())
-            self.assertEqual((root / "source/package.json").read_bytes(), b"{}")
+            for field, value in (("GITHUB_REPOSITORY", "other/repository"), ("GITHUB_REPOSITORY_ID", "1"),
+                                 ("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_REF", "refs/pull/1/merge"),
+                                 ("GITHUB_WORKFLOW_REF", "other/workflow@refs/heads/main")):
+                values = dict(environment(root), **{field: value})
+                with self.subTest(field=field), mock.patch.dict(os.environ, values), \
+                        mock.patch.object(build_config, "load", return_value=CONFIG), \
+                        mock.patch.object(instabox_build, "Client") as client:
+                    with self.assertRaises(ValueError):
+                        instabox_build.build()
+                    client.assert_not_called()
 
-    def test_machine_state_and_unknown_state(self):
-        self.assertEqual(instabox_build.machine_state({"machine": {"state": "Running"}}), "running")
-        self.assertEqual(instabox_build.machine_state({"status": "suspended"}), "suspended")
-        with self.assertRaises(ValueError):
-            instabox_build.machine_state({"name": "zero-forge"})
-
-    def test_remote_job_path_traversal_is_rejected(self):
-        for job in ("../outside", "123-1/../2", "0-1", "123-0", "abc"):
-            with self.subTest(job=job), self.assertRaises(ValueError):
-                remote_build.job_path(job)
+    def test_result_identity_attempt_name_and_size_are_verified(self):
+        good = {"status": "success", "exit_code": 0, "metadata": METADATA,
+                "archive": {"name": "dist.tar.gz", "size": 100, "sha256": "c" * 64}}
+        self.assertEqual(instabox_build.validate_result(good, METADATA)["size"], 100)
+        for update in ({"status": "failed"}, {"exit_code": 1}, {"metadata": dict(METADATA, build_run_attempt=2)},
+                       {"archive": {"name": "../other", "size": 100, "sha256": "c" * 64}},
+                       {"archive": {"name": "dist.tar.gz", "size": 80_000_001, "sha256": "c" * 64}},
+                       {"archive": {"name": "dist.tar.gz", "size": 100, "sha256": "bad"}}):
+            with self.subTest(update=list(update)), self.assertRaises(ValueError):
+                instabox_build.validate_result(dict(good, **update), METADATA)
 
 
 class ControllerLifecycleChecks(unittest.TestCase):
@@ -333,50 +88,64 @@ class ControllerLifecycleChecks(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         root = Path(folder.name)
         dist = root / "fixture"
-        (dist / "favicon").mkdir(parents=True)
-        for name in ("index.html", "404.html", "favicon/favicon.ico"):
-            (dist / name).write_bytes(b"file")
+        site_fixture(dist)
+        package = root / "remote.tar.gz"
+        descriptor = artifacts.pack(dist, package, METADATA)
         calls = []
-        environment = {"GITHUB_REPOSITORY": "metaxora/blog-source", "GITHUB_REPOSITORY_ID": "123456789",
-                       "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "workflow_dispatch",
-                       "GITHUB_SHA": SHA, "GITHUB_RUN_ID": "300", "GITHUB_RUN_ATTEMPT": "1",
-                       "RUNNER_TEMP": str(root), "INSTABOX_API_KEY": "test-api",
-                       "SOURCE_READ_TOKEN": "must-not-reach-cli", "BLOG_SIGNING_PRIVATE_KEY": "must-not-reach-cli"}
+        testcase = self
 
-        def command(argv, **kwargs):
-            if argv[:2] == ["git", "rev-parse"]:
-                return subprocess.CompletedProcess(argv, 0, SHA + "\n", "")
-            calls.append(argv)
-            child_env = kwargs["env"]
-            self.assertNotIn("SOURCE_READ_TOKEN", child_env)
-            self.assertNotIn("BLOG_SIGNING_PRIVATE_KEY", child_env)
-            self.assertNotIn("GITHUB_TOKEN", child_env)
-            if argv[1] == "get":
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": state}), "")
-            if argv[1] == "cp" and ":" in argv[2] and argv[2].endswith("website.zip"):
-                metadata = signer.expected_metadata(POLICY, SHA, 300, 1)
-                artifacts.pack(dist, Path(argv[3]), metadata)
-            if argv[1] == "exec":
-                remote_argv = argv[argv.index("--") + 1:]
-                if len(remote_argv) >= 3 and remote_argv[2] == "status":
+        class FakeClient:
+            def __init__(self, machine, credential):
+                testcase.assertEqual(machine, "m_test")
+                testcase.assertEqual(credential, "test-api")
+                self.polls = 0
+                self.woken = False
+
+            def json(self, method, suffix, body=None):
+                calls.append(("control", method, suffix))
+                if method == "GET":
+                    return {"state": "running" if self.woken else state}
+                self.woken = True
+                return {"state": "queued"}
+
+            def upload(self, path, data):
+                calls.append(("upload", path))
+                testcase.assertNotIn(b"test-api", data)
+                testcase.assertNotIn(b"test-github-token", data)
+
+            def execute(self, argv, timeout=60):
+                calls.append(("exec", *argv))
+                testcase.assertNotIn("test-api", json.dumps(argv))
+                testcase.assertNotIn("test-github-token", json.dumps(argv))
+                testcase.assertNotIn("must-not-reach-build", json.dumps(argv))
+                if len(argv) >= 3 and argv[2] == "status":
                     if cancel:
                         raise KeyboardInterrupt("simulated cancellation")
                     if outcome == "timeout":
-                        raise subprocess.TimeoutExpired(argv, 60)
+                        raise TimeoutError("simulated timeout")
                     if outcome == "network":
-                        raise RuntimeError("simulated network failure")
-                    stdout = json.dumps({"status": outcome, "exit_code": 0 if outcome == "success" else 1})
-                else:
-                    stdout = ""
-                if "--json" in argv:
-                    stdout = json.dumps({"exitCode": 0, "stdout": stdout, "timedOut": False, "truncated": False})
-                return subprocess.CompletedProcess(argv, 0, stdout, "")
-            return subprocess.CompletedProcess(argv, 0, "", "")
+                        raise ConnectionError("simulated network failure")
+                    self.polls += 1
+                    if self.polls == 1:
+                        return json.dumps({"status": "running", "exit_code": None})
+                    result = {"status": "failed" if outcome == "failed" else "success",
+                              "exit_code": 1 if outcome == "failed" else 0,
+                              "metadata": dict(METADATA, source_commit="b" * 40) if outcome == "identity" else METADATA,
+                              "archive": descriptor}
+                    return json.dumps(result)
+                return ""
 
-        with mock.patch.dict(os.environ, environment), mock.patch.object(pull, "source_policy", return_value=POLICY), \
-                mock.patch.object(instabox_build.shutil, "which", return_value="instabox"), \
-                mock.patch.object(instabox_build.subprocess, "run", side_effect=command), \
-                mock.patch.object(instabox_build, "source_archive", return_value="d" * 64):
+            def download(self, remote, destination, size, checksum, maximum):
+                calls.append(("download", remote))
+                testcase.assertTrue(remote.endswith("/300-1/dist.tar.gz"))
+                testcase.assertEqual(size, package.stat().st_size)
+                testcase.assertEqual(checksum, hashlib.sha256(package.read_bytes()).hexdigest())
+                destination.write_bytes(b"not a gzip" if outcome == "corrupt" else package.read_bytes())
+
+        with mock.patch.dict(os.environ, environment(root)), mock.patch.object(build_config, "load", return_value=CONFIG), \
+                mock.patch.object(instabox_build, "Client", FakeClient), \
+                mock.patch.object(instabox_build.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, SHA + "\n", "")), \
+                mock.patch.object(instabox_build.time, "sleep"):
             try:
                 instabox_build.build()
                 error = None
@@ -384,44 +153,117 @@ class ControllerLifecycleChecks(unittest.TestCase):
                 error = exc
         return calls, error, root
 
-    def test_paused_machine_is_resumed_and_product_is_verified(self):
+    def test_paused_machine_resumes_and_uses_file_download(self):
         calls, error, root = self.simulate("suspended")
         self.assertIsNone(error)
-        self.assertTrue(any(c[1] == "resume" for c in calls))
-        self.assertTrue((root / "firefly-output/website.zip").is_file())
+        self.assertIn(("control", "POST", "/resume"), calls)
+        self.assertTrue((root / "firefly-output/dist.tar.gz").is_file())
+        self.assertIn("payload_digest=sha256:", (root / "github-output").read_text())
+        self.assertEqual(len([c for c in calls if c[0] == "download"]), 1)
 
     def test_stopped_machine_is_started(self):
         calls, error, _ = self.simulate("stopped")
         self.assertIsNone(error)
-        self.assertTrue(any(c[1] == "start" for c in calls))
+        self.assertIn(("control", "POST", "/start"), calls)
 
-    def test_failed_build_does_not_retrieve_product(self):
-        calls, error, root = self.simulate("running", outcome="failed")
-        self.assertIsInstance(error, RuntimeError)
-        self.assertFalse((root / "firefly-output").exists())
-        self.assertTrue(any("cancel" in c for c in calls))
-        self.assertTrue(any("cleanup" in c for c in calls))
-
-    def test_cancel_requests_remote_process_group_cleanup(self):
-        calls, error, root = self.simulate("running", cancel=True)
-        self.assertIsInstance(error, KeyboardInterrupt)
-        self.assertFalse((root / "firefly-output").exists())
-        self.assertTrue(any("cancel" in c for c in calls))
-        self.assertTrue(any("cleanup" in c for c in calls))
-
-    def test_unknown_machine_state_does_not_start_a_build(self):
-        calls, error, _ = self.simulate("deleting")
-        self.assertIsInstance(error, ValueError)
-        self.assertEqual([c[1] for c in calls], ["get"])
-
-    def test_timeout_and_network_failure_request_cleanup_without_product(self):
-        for outcome in ("timeout", "network"):
+    def test_failures_cancel_owned_job_without_publishing_a_product(self):
+        for outcome in ("failed", "network", "timeout", "identity", "corrupt"):
             with self.subTest(outcome=outcome):
                 calls, error, root = self.simulate("running", outcome=outcome)
                 self.assertIsNotNone(error)
-                self.assertFalse((root / "firefly-output").exists())
-                self.assertTrue(any("cancel" in c for c in calls))
-                self.assertTrue(any("cleanup" in c for c in calls))
+                self.assertFalse((root / "firefly-output/dist.tar.gz").exists())
+                self.assertFalse((root / "github-output").exists())
+                self.assertTrue(any(c[0] == "exec" and "cancel" in c for c in calls))
+                self.assertTrue(any(c[0] == "exec" and "cleanup" in c for c in calls))
+
+    def test_cancel_requests_process_group_cleanup(self):
+        calls, error, root = self.simulate("running", cancel=True)
+        self.assertIsInstance(error, KeyboardInterrupt)
+        self.assertFalse((root / "firefly-output/dist.tar.gz").exists())
+        self.assertTrue(any(c[0] == "exec" and "cancel" in c for c in calls))
+
+    def test_unknown_state_does_not_start_a_job(self):
+        calls, error, _ = self.simulate("deleting")
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual(calls, [("control", "GET", "")])
+
+
+class SourceChecks(unittest.TestCase):
+    def test_async_start_waits_for_running_without_a_second_start(self):
+        client = mock.Mock()
+        client.json.side_effect = [{"state": "suspended"}, {"state": "queued"},
+                                   {"state": "resuming"}, {"state": "running"}]
+        with mock.patch.object(instabox_build.time, "sleep"):
+            instabox_build.ensure_running(client, instabox_build.time.monotonic() + 120)
+        self.assertEqual(client.json.call_count, 4)
+        self.assertEqual([call for call in client.json.call_args_list if call.args[0] == "POST"],
+                         [mock.call("POST", "/resume", {})])
+
+    def test_machine_start_failure_and_timeout_never_launch_a_worker(self):
+        client = mock.Mock()
+        client.json.side_effect = [{"state": "stopped"}, {"state": "failed"}]
+        with self.assertRaises(RuntimeError):
+            instabox_build.ensure_running(client, instabox_build.time.monotonic() + 120)
+        client.execute.assert_not_called()
+        client.json.side_effect = None
+        client.json.return_value = {"state": "starting"}
+        with mock.patch.object(instabox_build.time, "monotonic", return_value=100), self.assertRaises(TimeoutError):
+            instabox_build.ensure_running(client, 99)
+        client.execute.assert_not_called()
+
+    def test_remote_job_path_traversal_is_rejected(self):
+        for job in ("../outside", "123-1/../2", "0-1", "123-0", "abc"):
+            with self.subTest(job=job), self.assertRaises(ValueError):
+                remote_build.job_path(job)
+
+    def test_anonymous_cache_fetches_the_requested_commit_not_latest_tip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            repo, base = root / "public-repository", root / "build-cache"
+            repo.mkdir()
+            (base / "jobs/300-1").mkdir(parents=True)
+            for name in ("package.json", "public/index.html", ".env", "private.key", ".github/workflows/test.yml",
+                         "scripts/deploy/signing-public.pem"):
+                path = repo / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("first")
+            real_run = subprocess.run
+
+            def git(*args):
+                return real_run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                                 "-c", "commit.gpgsign=false", "-c", "user.name=Fixture",
+                                 "-c", "user.email=fixture@example.invalid", *args],
+                                cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+            git("init", "--quiet")
+            git("add", "--all")
+            git("commit", "--quiet", "-m", "first")
+            first = git("rev-parse", "HEAD")
+            (repo / "public/index.html").write_text("second")
+            git("add", "--all")
+            git("commit", "--quiet", "-m", "second")
+            second = git("rev-parse", "HEAD")
+            fetches = []
+
+            def command(argv, **kwargs):
+                if "fetch" in argv:
+                    fetches.append(list(argv))
+                    testcase.assertIn("https://github.com/metaxora/Firefly-hyde.git", argv)
+                    argv = [str(repo) if a == "https://github.com/metaxora/Firefly-hyde.git" else a for a in argv]
+                return real_run(argv, **kwargs)
+            testcase = self
+            with mock.patch.object(remote_build, "BASE", base), mock.patch.object(remote_build.subprocess, "run", side_effect=command):
+                source = remote_build.prepare_source(base / "jobs/300-1", first, os.environ.copy())
+                self.assertEqual((source / "public/index.html").read_text(), "first")
+                self.assertFalse((source / ".env").exists())
+                self.assertFalse((source / "private.key").exists())
+                self.assertFalse((source / ".github").exists())
+                self.assertFalse((source / ".git").exists())
+                self.assertEqual((source / "scripts/deploy/signing-public.pem").read_text(), "first")
+                (base / "jobs/301-1").mkdir()
+                newer = remote_build.prepare_source(base / "jobs/301-1", second, os.environ.copy())
+                self.assertEqual((newer / "public/index.html").read_text(), "second")
+            self.assertEqual(len(fetches), 2)
+            self.assertTrue((base / "repository.git").is_dir())
 
 
 @unittest.skipIf(os.name == "nt", "Linux process groups and locking")
@@ -448,6 +290,71 @@ class RemoteLifecycleChecks(unittest.TestCase):
             path.mkdir(parents=True)
             (path / "pid").write_text(str(os.getpid()))
             self.assertIsNone(remote_build.process_owned(path))
+
+
+@unittest.skipIf(os.name == "nt", "Linux stdin signing and original zero compatibility")
+class SignedPreviewChecks(unittest.TestCase):
+    def exercise(self, publish_flag, newer_main=False):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            source = root / "source"
+            site_fixture(source)
+            payload = root / "dist.tar.gz"
+            artifacts.pack(source, payload, METADATA)
+            prepare_build.prepare(payload, workspace / "dist", METADATA, artifacts.digest(payload))
+            private = subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519"], check=True, capture_output=True).stdout
+            public = subprocess.run(["openssl", "pkey", "-pubout"], input=private, check=True, capture_output=True).stdout
+            key = root / "public.pem"
+            key.write_bytes(public)
+            values = dict(environment(root), BLOG_SIGNING_PRIVATE_KEY=private.decode(), RELEASE_PUBLISH=publish_flag)
+            real_run = subprocess.run
+            remote_calls = []
+
+            def command(argv, **kwargs):
+                if argv and argv[0] == "git" and any(a in ("ls-remote", "push") for a in argv):
+                    remote_calls.append(list(argv))
+                    if "push" in argv:
+                        raise AssertionError("A dry-run or obsolete build must never push")
+                    if newer_main:
+                        return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\trefs/heads/main\n", "")
+                    raise AssertionError("A dry-run must not query or update remote branches")
+                return real_run(argv, **kwargs)
+            previous = Path.cwd()
+            try:
+                os.chdir(workspace)
+                with mock.patch.dict(os.environ, values), mock.patch.object(build_config, "load", return_value=CONFIG), \
+                        mock.patch.object(publish, "PUBLIC_KEY", key), mock.patch.object(publish.subprocess, "run", side_effect=command):
+                    publish.main()
+                if publish_flag == "false":
+                    preview = root / "firefly-preview"
+                    info = json.loads((preview / "release-info.json").read_text())
+                    self.assertEqual(info["schema"], 2)
+                    self.assertEqual(info["source_commit"], SHA)
+                    prefix = "Firefly-hyde-" + info["release_commit"] + "/"
+                    with zipfile.ZipFile(preview / "release.zip") as z:
+                        data, signature = z.read(prefix + "deployment.json"), z.read(prefix + "deployment.sig")
+                    manifest = pull.verified_manifest(data, signature, key)
+                    self.assertEqual(manifest["workflow_run_id"], 300)
+                    self.assertNotIn("source_repository", manifest)
+                    checked = root / "original-parser"
+                    checked.mkdir()
+                    pull.extract_checked(preview / "release.zip", manifest, info["release_commit"], checked,
+                                         signature=signature, manifest_bytes=data)
+                    self.assertEqual((checked / "index.html").read_bytes(), b"file")
+                    self.assertEqual(remote_calls, [])
+                else:
+                    self.assertTrue(remote_calls)
+                    self.assertFalse((root / "firefly-preview").exists())
+            finally:
+                os.chdir(previous)
+
+    def test_tar_to_signed_preview_uses_original_zero_manifest_and_parser(self):
+        self.exercise("false")
+
+    def test_newer_main_prevents_a_stale_build_from_pushing(self):
+        self.exercise("true", newer_main=True)
 
 
 if __name__ == "__main__":

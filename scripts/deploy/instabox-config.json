@@ -1,0 +1,8 @@
+{
+  "repository": "metaxora/Firefly-hyde",
+  "repository_id": 1432930314,
+  "workflow_path": ".github/workflows/build.yml",
+  "machine_id": "m_agqxotxgzkyg7lawsooh5fr2hi",
+  "node_version": "22.23.3",
+  "pnpm_version": "11.22.0"
+}

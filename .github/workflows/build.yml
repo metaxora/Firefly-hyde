@@ -8,88 +8,98 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to blog-deploy after the build passes (false saves a signed preview only)"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
   group: build-blog-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   check:
-    if: github.repository == 'metaxora/Firefly-hyde'
-    name: Check source
+    name: Check deployment
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - uses: pnpm/action-setup@v6
-        with:
-          run_install: false
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Check deployment scripts
+      - name: Deployment security and lifecycle tests
         run: python3 -B -m unittest discover -s scripts/deploy -p 'test_*.py' -v
-      - name: Astro check
-        run: pnpm check
-      - name: TypeScript check
-        if: success() || failure()
-        run: pnpm type-check
+      - name: Draft exclusion tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/draft-tests"
+          npm install --prefix "$RUNNER_TEMP/draft-tests" --no-audit --no-fund --ignore-scripts gray-matter@4.0.3
+          cp scripts/deploy/strip-drafts.mjs scripts/deploy/test-drafts.mjs "$RUNNER_TEMP/draft-tests/"
+          node "$RUNNER_TEMP/draft-tests/test-drafts.mjs"
 
   build:
-    if: github.repository == 'metaxora/Firefly-hyde'
-    name: Build website
+    name: Check and build on InstaBox
+    needs: check
+    if: github.repository == 'metaxora/Firefly-hyde' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.INSTABOX_AUTO_BUILD_ENABLED == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      payload_digest: ${{ steps.remote.outputs.payload_digest }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - uses: pnpm/action-setup@v6
-        with:
-          run_install: false
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Build website
-        run: pnpm build
-      - name: Check homepage
-        run: test -s dist/index.html
-      - name: Save website files
+      - name: Build and download tar through the official file API
+        id: remote
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+        run: python3 -B scripts/deploy/instabox_build.py build
+      - name: Save validated build package
         uses: actions/upload-artifact@v7
         with:
-          name: blog-dist
-          path: dist/
+          name: blog-dist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/firefly-output/dist.tar.gz
           if-no-files-found: error
           retention-days: 3
+          compression-level: 0
 
   publish:
-    name: Publish website
+    name: Verify and sign website
     needs: [check, build]
     if: github.repository == 'metaxora/Firefly-hyde' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Download verified build
+      - name: Download this run's build
         uses: actions/download-artifact@v8
         with:
-          name: blog-dist
-          path: dist/
-      - name: Publish static release
+          name: blog-dist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/firefly-artifact
+      - name: Verify build digest, identity and tar contents
+        env:
+          BUILD_PAYLOAD: ${{ runner.temp }}/firefly-artifact/dist.tar.gz
+          EXPECTED_PAYLOAD_DIGEST: ${{ needs.build.outputs.payload_digest }}
+        run: python3 -B scripts/deploy/prepare_build.py
+      - name: Sign and verify the version-2 release
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BLOG_SIGNING_PRIVATE_KEY: ${{ secrets.BLOG_SIGNING_PRIVATE_KEY }}
+          RELEASE_PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
         run: python3 -B scripts/deploy/publish.py
+      - name: Save signed preview for inspection
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        uses: actions/upload-artifact@v7
+        with:
+          name: blog-signed-preview-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/firefly-preview/
+          if-no-files-found: error
+          retention-days: 3

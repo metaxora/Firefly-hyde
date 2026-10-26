@@ -1,6 +1,6 @@
 # zero 自动发布
 
-InstaBox 私有源码迁移说明见 [MIGRATION.md](MIGRATION.md)。新流程默认候选发布和关闭自动构建；下文描述的是仍在运行的旧公开源码流程，正式切换完成后再更新当前状态。
+InstaBox 单仓库构建集成见 [MIGRATION.md](MIGRATION.md)。新流程的手动运行默认仅保存签名预览、自动构建默认关闭；下文描述的是仍在运行的原 GitHub 构建流程，正式切换完成后再更新当前状态。
 
 此部署针对公开仓库 `metaxora/Firefly-hyde` 和站点 `https://metaxora.com/`。
 
