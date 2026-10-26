@@ -1,0 +1,21 @@
+name: Test InstaBox deployment
+
+on:
+  push:
+    branches: [migration/instabox]
+    paths: ['scripts/deploy/**', '.github/workflows/instabox-*.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Deployment security, lifecycle and rollback checks
+        run: python3 -B -m unittest discover -s scripts/deploy -p 'test_*.py' -v

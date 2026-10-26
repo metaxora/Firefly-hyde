@@ -1,0 +1,39 @@
+name: Build on InstaBox
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - src/data/friends-latency-snapshot.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: instabox-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'metaxora/blog-source' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.AUTO_BUILD_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install verified official InstaBox CLI
+        run: python3 -B scripts/deploy/instabox_build.py install-cli
+      - name: Check, build and retrieve static files
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+        run: python3 -B scripts/deploy/instabox_build.py build
+      - name: Keep private build output for signing
+        uses: actions/upload-artifact@v7
+        with:
+          name: blog-dist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/firefly-output/website.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0

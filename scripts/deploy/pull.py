@@ -14,6 +14,8 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from artifacts import check_bytes, safe_name
+
 REPOSITORY = "metaxora/Firefly-hyde"
 BRANCH = "blog-deploy"
 BASE = Path("/var/www/metaxora-blog")
@@ -23,6 +25,16 @@ API = "https://api.github.com/repos/" + REPOSITORY
 MAX_DOWNLOAD = 80_000_000
 STALE_TEMP_SECONDS = 60 * 60
 RESERVED = {"panel", "status", "wb", "whale", ".well-known", "deployment-version.json"}
+
+
+def source_policy():
+    policy = json.loads(Path(__file__).with_name("source-policy.json").read_text(encoding="utf-8"))
+    if (policy.get("source_repository") != "metaxora/blog-source"
+            or type(policy.get("source_repository_id")) is not int or policy["source_repository_id"] < 1
+            or policy.get("build_workflow_path") != ".github/workflows/instabox-build.yml"
+            or policy.get("publisher_workflow_path") != ".github/workflows/instabox-publish.yml"):
+        raise ValueError("Private repository policy is not configured")
+    return policy
 
 
 def cleanup_stale(now=None):
@@ -124,32 +136,59 @@ def verified_manifest(data, signature, public_key=None):
 
 def validate_release_order(manifest, applied):
     if applied:
+        if manifest["schema"] < applied.get("minimum_schema", applied.get("schema", 2)):
+            raise ValueError("Refusing deployment protocol downgrade")
         previous = (int(applied["workflow_run_id"]), int(applied.get("workflow_run_attempt", 1)))
         candidate = (manifest["workflow_run_id"], manifest["workflow_run_attempt"])
         if candidate <= previous:
             raise ValueError("Refusing replay of an older or already deployed build")
+        if manifest["schema"] == 3 and applied.get("schema") == 3:
+            if (manifest["build_run_id"], manifest["build_run_attempt"]) <= (applied["build_run_id"], applied["build_run_attempt"]):
+                raise ValueError("Refusing replay of an older source build")
 
 
 def validate_manifest(manifest):
-    if (manifest.get("schema") != 2 or manifest.get("repository") != REPOSITORY
+    if not isinstance(manifest, dict):
+        raise ValueError("Unexpected deployment manifest")
+    if (type(manifest.get("schema")) is not int or manifest.get("schema") not in (2, 3) or manifest.get("repository") != REPOSITORY
             or manifest.get("repository_id") != 1432930314 or manifest.get("source_branch") != "main"):
         raise ValueError("Unexpected deployment manifest")
-    if not re.fullmatch(r"[0-9a-f]{40}", manifest.get("source_commit", "")):
+    if not isinstance(manifest.get("source_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):
         raise ValueError("Invalid source commit")
-    if not isinstance(manifest.get("workflow_run_id"), int) or manifest["workflow_run_id"] < 1:
+    if type(manifest.get("workflow_run_id")) is not int or manifest["workflow_run_id"] < 1:
         raise ValueError("Invalid workflow run")
-    if not isinstance(manifest.get("workflow_run_attempt"), int) or manifest["workflow_run_attempt"] < 1:
+    if type(manifest.get("workflow_run_attempt")) is not int or manifest["workflow_run_attempt"] < 1:
         raise ValueError("Invalid workflow attempt")
+    if manifest["schema"] == 3:
+        policy = source_policy()
+        if (manifest.get("source_repository") != policy["source_repository"]
+                or type(manifest.get("source_repository_id")) is not int
+                or manifest["source_repository_id"] != policy["source_repository_id"]
+                or manifest.get("build_workflow_path") != policy["build_workflow_path"]
+                or manifest.get("publisher_workflow_path") != policy["publisher_workflow_path"]
+                or manifest.get("channel") not in ("candidate", "production")):
+            raise ValueError("Unexpected build provenance")
+        for field in ("build_run_id", "build_run_attempt", "artifact_id"):
+            if type(manifest.get(field)) is not int or manifest[field] < 1:
+                raise ValueError("Invalid build provenance identifier")
+        if not isinstance(manifest.get("publisher_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", manifest["publisher_commit"]):
+            raise ValueError("Invalid publisher commit")
+        if not isinstance(manifest.get("artifact_digest"), str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest["artifact_digest"]):
+            raise ValueError("Invalid artifact digest")
     files = manifest.get("files", {})
-    if not 3 <= len(files) <= 3000 or not {"index.html", "404.html", "favicon/favicon.ico"} <= files.keys():
+    if not isinstance(files, dict) or not 3 <= len(files) <= 3000 or not {"index.html", "404.html", "favicon/favicon.ico"} <= files.keys():
         raise ValueError("Incomplete website manifest")
     for name, info in files.items():
+        if not isinstance(name, str) or not isinstance(info, dict):
+            raise ValueError("Invalid file metadata")
         path = PurePosixPath(name)
-        if path.is_absolute() or ".." in path.parts or "\\" in name or str(path) != name or not path.parts:
+        if path.is_absolute() or ".." in path.parts or "\\" in name or ":" in name or str(path) != name or not path.parts:
             raise ValueError("Unsafe website path")
         if path.parts[0] in RESERVED or any(p.startswith(".") for p in path.parts):
             raise ValueError("Reserved website path")
-        if not re.fullmatch(r"[0-9a-f]{64}", info.get("sha256", "")) or not isinstance(info.get("size"), int) or not 0 <= info["size"] <= 50_000_000:
+        if manifest["schema"] == 3:
+            safe_name(name)
+        if not isinstance(info.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", info["sha256"]) or type(info.get("size")) is not int or not 0 <= info["size"] <= 50_000_000:
             raise ValueError("Invalid file metadata")
     if sum(f["size"] for f in files.values()) > 200_000_000:
         raise ValueError("Expanded website exceeds size limit")
@@ -195,6 +234,8 @@ def extract_checked(archive, manifest, commit, target, signature=None, manifest_
             info = manifest["files"][name]
             if len(data) != info["size"] or hashlib.sha256(data).hexdigest() != info["sha256"]:
                 raise ValueError("Website checksum mismatch")
+            if manifest["schema"] == 3:
+                check_bytes(name, data)
             destination = target / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
@@ -239,9 +280,24 @@ def activate(release, previous, health=origin):
         raise
 
 
-def deploy():
+def validate_workflow(manifest, run):
+    modern = manifest["schema"] == 3
+    expected_sha = manifest["publisher_commit"] if modern else manifest["source_commit"]
+    expected_path = source_policy()["publisher_workflow_path"] if modern else ".github/workflows/build.yml"
+    events = ("workflow_dispatch",) if modern else ("push", "workflow_dispatch")
+    if (run.get("status") != "completed" or run.get("conclusion") != "success"
+            or run.get("id") != manifest["workflow_run_id"] or run.get("head_sha") != expected_sha
+            or run.get("head_branch") != "main" or run.get("event") not in events
+            or run.get("run_attempt") != manifest["workflow_run_attempt"]
+            or run.get("repository", {}).get("id") != 1432930314 or run.get("path") != expected_path):
+        raise ValueError("Publication is not from a successful trusted workflow")
+
+
+def deploy(branch=BRANCH, verify_only=False, expected_commit=None):
+    if branch not in (BRANCH, "blog-deploy-candidate") or (branch != BRANCH and not verify_only):
+        raise ValueError("Candidate branch requires read-only verification")
     try:
-        ref = json_at(API + "/git/ref/heads/" + BRANCH)
+        ref = json_at(API + "/git/ref/heads/" + branch)
     except urllib.error.HTTPError as error:
         if error.code == 404:
             print("No published website yet; keeping current release.", flush=True)
@@ -250,25 +306,37 @@ def deploy():
     commit = ref["object"]["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Invalid deployment commit")
+    if expected_commit is not None and commit != expected_commit:
+        raise ValueError("Deployment branch changed during verification")
     state_file = STATE / "state.json"
     applied = json.loads(state_file.read_text()) if state_file.exists() else {}
-    if applied.get("deployment_commit") == commit:
+    if not verify_only and applied.get("deployment_commit") == commit:
         print("Current release is up to date: " + applied["source_commit"], flush=True)
         return
     raw_base = "https://raw.githubusercontent.com/" + REPOSITORY + "/" + commit + "/"
     manifest_data = download(raw_base + "deployment.json", 1_000_000)
     signature = download(raw_base + "deployment.sig", 1024)
     manifest = verified_manifest(manifest_data, signature)
+    if manifest["schema"] == 3 and manifest["channel"] != ("production" if branch == BRANCH else "candidate"):
+        raise ValueError("Deployment channel mismatch")
     validate_release_order(manifest, applied)
     run = json_at(API + "/actions/runs/" + str(manifest["workflow_run_id"]))
     if run.get("status") != "completed":
+        if verify_only:
+            raise ValueError("Published workflow has not completed")
         print("Published workflow is still finishing; waiting for next check.", flush=True)
         return
-    if (run.get("conclusion") != "success" or run.get("head_sha") != manifest["source_commit"]
-            or run.get("head_branch") != "main" or run.get("event") not in ("push", "workflow_dispatch")
-            or run.get("run_attempt") != manifest["workflow_run_attempt"] or run.get("repository", {}).get("id") != 1432930314
-            or run.get("path") != ".github/workflows/build.yml"):
-        raise ValueError("Publication is not from a successful main build")
+    validate_workflow(manifest, run)
+    if verify_only:
+        with tempfile.TemporaryDirectory(prefix="blog-readonly-") as folder:
+            root = Path(folder)
+            archive = root / "website.zip"
+            archive.write_bytes(download("https://codeload.github.com/" + REPOSITORY + "/zip/" + commit, MAX_DOWNLOAD))
+            target = root / "site"
+            target.mkdir()
+            extract_checked(archive, manifest, commit, target, signature=signature, manifest_bytes=manifest_data)
+        print("VERIFIED read-only: " + commit, flush=True)
+        return
     releases = BASE / "releases"
     previous = (BASE / "current").resolve(strict=True)
     if previous.parent != releases or previous.is_symlink():
@@ -286,6 +354,11 @@ def deploy():
                   "signature_verified": True, "signature_algorithm": "Ed25519",
                   "signing_key_id": hashlib.sha256(TRUSTED_PUBLIC_KEY.read_bytes()).hexdigest()[:8],
                   "deployed_at": datetime.now(timezone.utc).isoformat()}
+        record["schema"] = manifest["schema"]
+        record["minimum_schema"] = max(manifest["schema"], applied.get("minimum_schema", 2))
+        if manifest["schema"] == 3:
+            for field in ("source_repository", "source_repository_id", "build_run_id", "build_run_attempt", "artifact_id", "artifact_digest", "publisher_commit"):
+                record[field] = manifest[field]
         (stage / "deployment-version.json").write_text(json.dumps(record, indent=2) + "\n")
         (stage / "deployment-version.json").chmod(0o644)
         if release.exists():
@@ -326,4 +399,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--branch", choices=(BRANCH, "blog-deploy-candidate"), default=BRANCH)
+    parser.add_argument("--expected-commit")
+    args = parser.parse_args()
+    if args.verify_only:
+        deploy(args.branch, True, args.expected_commit)
+    elif args.branch != BRANCH or args.expected_commit:
+        parser.error("branch/commit overrides require --verify-only")
+    else:
+        main()
