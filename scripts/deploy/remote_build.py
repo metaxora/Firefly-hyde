@@ -113,12 +113,15 @@ def worker(path, source_hash, metadata):
             pnpm = ["npx", "--yes", "pnpm@" + metadata["pnpm_version"]]
             run([*pnpm, "install", "--frozen-lockfile", "--store-dir", str(BASE / "pnpm-store")])
             run(["python3", "-B", "-m", "unittest", "discover", "-s", "scripts/deploy", "-p", "test_*.py", "-v"])
+            run(["node", "scripts/deploy/test-drafts.mjs"])
+            run(["node", "scripts/deploy/strip-drafts.mjs"])
             run([*pnpm, "check"])
             run([*pnpm, "type-check"])
             run([*pnpm, "build"], timeout=720)
             spec = importlib.util.spec_from_file_location("build_artifacts", source / "scripts/deploy/artifacts.py")
             artifacts = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(artifacts)
+            artifacts.sanitize_distribution(source / "dist")
             artifacts.pack(source / "dist", path / "website.zip", metadata)
             result = {"status": "success", "exit_code": 0}
     except Exception as error:

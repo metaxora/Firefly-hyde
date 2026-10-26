@@ -160,6 +160,24 @@ class ArtifactPrivacyChecks(unittest.TestCase):
         data = outer.getvalue()
         return data, "sha256:" + hashlib.sha256(data).hexdigest()
 
+    def test_debug_maps_are_removed_without_changing_runtime_code(self):
+        (self.dist / "pio").mkdir()
+        (self.dist / "pio/README.md").write_text("asset documentation")
+        (self.dist / "app.js.map").write_text('{"sourcesContent":["private source"]}')
+        (self.dist / "app.js").write_bytes(b"const answer = 42;\n//# sourceMappingURL=app.js.map\n")
+        (self.dist / "style.css").write_bytes(b"body {color: red}\n/*# sourceMappingURL=style.css.map */\n")
+        self.assertEqual(artifacts.sanitize_distribution(self.dist), 2)
+        self.assertEqual((self.dist / "app.js").read_bytes(), b"const answer = 42;\n")
+        self.assertEqual((self.dist / "style.css").read_bytes(), b"body {color: red}")
+        artifacts.pack(self.dist, self.root / "website.zip", self.metadata)
+
+    def test_sanitizing_does_not_silently_publish_other_source_files(self):
+        (self.dist / "private.md").write_text("private draft")
+        artifacts.sanitize_distribution(self.dist)
+        self.assertTrue((self.dist / "private.md").exists())
+        with self.assertRaisesRegex(ValueError, "Source file"):
+            artifacts.pack(self.dist, self.root / "website.zip", self.metadata)
+
     def test_private_payload_round_trip_and_digest(self):
         payload = self.root / "website.zip"
         artifacts.pack(self.dist, payload, self.metadata)
@@ -245,6 +263,28 @@ class ReadOnlyChecks(unittest.TestCase):
 
 
 class SourceSnapshotChecks(unittest.TestCase):
+    def test_snapshot_excludes_tracked_secrets_and_workflow_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "repo"
+            root.mkdir()
+            for name in ("package.json", "public/index.html", ".env", ".env.production", "private.key", "private.pem", ".github/workflows/test.yml"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture")
+            def git(*args):
+                subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                                "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", *args],
+                               cwd=root, check=True, capture_output=True)
+            git("init", "--quiet")
+            git("add", "--all")
+            git("commit", "--quiet", "-m", "fixture")
+            archive = Path(folder) / "source.tar"
+            checksum = instabox_build.source_archive(root, archive)
+            self.assertEqual(checksum, hashlib.sha256(archive.read_bytes()).hexdigest())
+            with tarfile.open(archive) as tar:
+                files = {entry.name for entry in tar if entry.isfile()}
+            self.assertEqual(files, {"package.json", "public/index.html"})
+
     def test_tar_escape_links_wrong_hash_and_environment_files(self):
         for kind in ("escape", "link", "environment", "digest"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder:
@@ -321,6 +361,10 @@ class ControllerLifecycleChecks(unittest.TestCase):
                 if len(remote_argv) >= 3 and remote_argv[2] == "status":
                     if cancel:
                         raise KeyboardInterrupt("simulated cancellation")
+                    if outcome == "timeout":
+                        raise subprocess.TimeoutExpired(argv, 60)
+                    if outcome == "network":
+                        raise RuntimeError("simulated network failure")
                     stdout = json.dumps({"status": outcome, "exit_code": 0 if outcome == "success" else 1})
                 else:
                     stdout = ""
@@ -369,6 +413,15 @@ class ControllerLifecycleChecks(unittest.TestCase):
         calls, error, _ = self.simulate("deleting")
         self.assertIsInstance(error, ValueError)
         self.assertEqual([c[1] for c in calls], ["get"])
+
+    def test_timeout_and_network_failure_request_cleanup_without_product(self):
+        for outcome in ("timeout", "network"):
+            with self.subTest(outcome=outcome):
+                calls, error, root = self.simulate("running", outcome=outcome)
+                self.assertIsNotNone(error)
+                self.assertFalse((root / "firefly-output").exists())
+                self.assertTrue(any("cancel" in c for c in calls))
+                self.assertTrue(any("cleanup" in c for c in calls))
 
 
 @unittest.skipIf(os.name == "nt", "Linux process groups and locking")

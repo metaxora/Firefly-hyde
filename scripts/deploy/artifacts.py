@@ -40,6 +40,35 @@ def check_bytes(name, data):
         raise ValueError("Source map reference in website")
 
 
+def sanitize_distribution(dist):
+    """Remove debug maps and the theme's bundled asset README from output only."""
+    if dist.is_symlink() or not dist.is_dir():
+        raise ValueError("Invalid build output directory")
+    root = dist.resolve()
+    paths = list(dist.rglob("*"))
+    if any(p.is_symlink() for p in paths):
+        raise ValueError("Build contains a symlink")
+    removed = 0
+    for path in paths:
+        if not path.is_file():
+            continue
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("Build file escapes output directory")
+        name = path.relative_to(dist).as_posix()
+        if path.suffix.lower() == ".map" or name == "pio/README.md":
+            path.unlink()
+            removed += 1
+        elif path.suffix.lower() in {".js", ".css"}:
+            original = path.read_bytes()
+            # Only standalone final comments are removed. Ambiguous references
+            # remain and are rejected by check_bytes rather than changing code.
+            cleaned = re.sub(rb"(?m)^[ \t]*//[#@][ \t]*sourceMappingURL=[^\r\n]*(?:\r?\n)?\Z", b"", original)
+            cleaned = re.sub(rb"(?:\r?\n)?[ \t]*/\*[#@][ \t]*sourceMappingURL=[^*]*\*/[ \t]*(?:\r?\n)?\Z", b"", cleaned)
+            if cleaned != original:
+                path.write_bytes(cleaned)
+    return removed
+
+
 def checked_entries(archive):
     entries = archive.infolist()
     if len(entries) > MAX_FILES + 100 or sum(e.file_size for e in entries) > MAX_EXPANDED + 100_000:

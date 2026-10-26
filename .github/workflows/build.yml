@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   check:
+    if: github.repository == 'metaxora/Firefly-hyde'
     name: Check source
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -42,6 +43,7 @@ jobs:
         run: pnpm type-check
 
   build:
+    if: github.repository == 'metaxora/Firefly-hyde'
     name: Build website
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -19,3 +19,9 @@ jobs:
           persist-credentials: false
       - name: Deployment security, lifecycle and rollback checks
         run: python3 -B -m unittest discover -s scripts/deploy -p 'test_*.py' -v
+      - name: Draft privacy checks with the production frontmatter parser
+        run: |
+          mkdir -p "$RUNNER_TEMP/draft-tests"
+          npm install --prefix "$RUNNER_TEMP/draft-tests" --no-audit --no-fund --ignore-scripts gray-matter@4.0.3
+          cp scripts/deploy/strip-drafts.mjs scripts/deploy/test-drafts.mjs "$RUNNER_TEMP/draft-tests/"
+          node "$RUNNER_TEMP/draft-tests/test-drafts.mjs"

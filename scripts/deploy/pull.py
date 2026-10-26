@@ -266,7 +266,7 @@ def switch(target):
 
 
 def activate(release, previous, health=origin):
-    routes = ["/panel/", "/status/", "/wb/v1"]
+    routes = ["/panel/", "/status/", "/wb/v1", "/whale/whale.js"]
     baseline = {p: hashlib.sha256(health(p)).hexdigest() for p in routes}
     try:
         switch(release)
