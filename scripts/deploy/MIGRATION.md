@@ -1,6 +1,6 @@
 # InstaBox 单仓库构建集成
 
-状态（2026-10-27）：首次手动 publish=true 正式发布已完成，zero 沿用原程序自动验签上线，公网验收通过；未修改 zero，自动构建保持关闭。
+状态（2026-10-27）：正式发布及公网验收完成；INSTABOX_AUTO_BUILD_ENABLED=true 已核验，main 自动构建发布已启用。构建机为 zero-forge，生产 zero 保持原程序与配置。
 
 ## 固定架构
 
@@ -15,8 +15,8 @@
 - PR 只执行不带秘密的部署代码和草稿筛除测试；不接触 InstaBox 和签名 Secret。
 - main 的依赖安装、Astro 检查、TypeScript 检查和完整构建在 InstaBox 执行。
 - 手动运行的 publish 选项默认 false：生成并复验签名预览包，不查询或更新远端分支。
-- publish=true 才推送 blog-deploy。每次推送前重新核对 main 的最新 SHA，过时构建直接跳过。
-- 自动构建变量默认关闭；真实试跑和正式验收成功后才启用。
+- main 提交自动构建并推送 blog-deploy；手动运行只有 publish=true 才推送。每次推送前重新核对 main 的最新 SHA，过时构建直接跳过。
+- 真实试跑和正式验收通过后，用户已启用自动构建变量。设为 false 可暂停 main 自动构建，手动入口继续保留。
 - 发布使用独立临时 Git 仓库、用户的 noreply 提交身份及 force-with-lease，源码工作区不切换、不清空。
 - zero 继续等整个工作流成功后才验签上线；失败或运行未结束时保留原网站。
 
@@ -63,7 +63,7 @@ GET /v1/machines/{id}/files/content?path=<绝对路径>
 | --- | --- | --- |
 | Secret | INSTABOX_API_KEY | 现有构建机查询、唤醒、执行和文件接口的最小可用权限 |
 | 已有 Secret | BLOG_SIGNING_PRIVATE_KEY | 保持原值，不导出、不轮换 |
-| Variable | INSTABOX_AUTO_BUILD_ENABLED | 初始 false，真实验收通过后才设 true |
+| Variable | INSTABOX_AUTO_BUILD_ENABLED | 已设 true，main 提交自动构建发布 |
 
 发布使用 GitHub 自动提供的临时 GITHUB_TOKEN。没有额外 GitHub PAT，不给 zero 或 InstaBox 配置签名密钥或生产管理 SSH 密钥。签名公钥完整 SHA-256 仍为：
 
@@ -89,7 +89,9 @@ InstaBox 的 51 项测试、草稿筛除、Astro／TypeScript 检查和完整构
 
 公网 15 项核验通过。首页和文章仅多出 Cloudflare 注入的统计脚本及换行（367 字节），移除这段已识别注入后内容摘要匹配签名清单；图标、CSS、JS、Pagefind 代码与索引直接匹配。panel、status、wb、wb/v1、whale.js、whale.css 内容摘要与发布前一致；whale 目录保留既有 403。未修改 zero 的程序、timer、公钥、Nginx 或凭据；未通过 SSH 操作生产机。既有回退和清理机制沿用，本次未制造生产故障重复测试回退。
 
-本地部署记录及两份 Obsidian 运维笔记已更新。用户此次仅授权一次正式发布；INSTABOX_AUTO_BUILD_ENABLED 保持关闭，后续需另行明确启用后，main 提交才自动构建发布。暂停唤醒和独立冷／热缓存基准仍未额外实测。
+该次手动正式发布完成时自动构建仍关闭。随后用户明确授权启用，并亲自在 GitHub 设置页保存 INSTABOX_AUTO_BUILD_ENABLED=true；[配置核验运行 40448679418](https://github.com/metaxora/Firefly-hyde/actions/runs/40448679418) 成功读取 true，并核对 main 工作流的 push 条件、签名发布条件及 zero-forge 的固定机器 ID。核验仅检查配置，没有额外触发网站构建或正式发布；临时核验工作流随后移除。
+
+当前日常流程为：提交 main → GitHub 调度 zero-forge 构建 → GitHub 校验、签名并更新 blog-deploy → zero 下载、验签上线。只更新 friends-latency-snapshot.json 的提交按原规则跳过，带 skip ci 的维护提交也不触发；手动预览／重试入口保留。本地部署记录和两份 Obsidian 笔记已同步当前状态。暂停唤醒和独立冷／热缓存基准仍未额外实测。
 
 构建速度按实际唤醒、安装、检查、编译和传输耗时记录，不预设 2 秒或 3 秒。GitHub 等待远程构建期间仍计入 Actions 运行分钟。
 
