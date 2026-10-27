@@ -1,6 +1,6 @@
 # zero 自动发布
 
-InstaBox 单仓库构建集成见 [MIGRATION.md](MIGRATION.md)。代码已合并，真实构建及签名预览通过；手动运行默认仅保存签名预览，自动构建仍关闭，正式网站继续运行原签名版本，尚未切换。
+InstaBox 单仓库构建集成见 [MIGRATION.md](MIGRATION.md)。2026-10-27 已完成首次手动正式发布并由 zero 验签上线；手动运行默认仍仅保存签名预览，正式发布需选择 publish=true。自动构建仍关闭，单纯提交 main 不会自动上线。
 
 此部署针对公开仓库 `metaxora/Firefly-hyde` 和站点 `https://metaxora.com/`。
 

@@ -1,6 +1,6 @@
 # InstaBox 单仓库构建集成
 
-状态（2026-10-27）：代码已合并 main，真实构建及 publish=false 签名预览通过；尚未更新 blog-deploy，未操作 zero，自动构建保持关闭。
+状态（2026-10-27）：首次手动 publish=true 正式发布已完成，zero 沿用原程序自动验签上线，公网验收通过；未修改 zero，自动构建保持关闭。
 
 ## 固定架构
 
@@ -79,9 +79,17 @@ f607ca4303c9f5f110fd872d37c5a0bb6beed1545d6553774c683add31bfc5bc
 
 首轮试跑遇到 InstaBox HTTP 502 后停止，签名跳过；重试成功。远程检查、构建与下载共 153.48 秒，成功尝试从启动至工作流完成共 246 秒。该次运行不能代替独立冷／热缓存对照；实际暂停唤醒尚未实测。[API 预检](https://github.com/metaxora/Firefly-hyde/actions/runs/40441312502) 已验证 2,097,169 字节二进制下载的长度与摘要。实机不能由普通用户直接写入 /data 根目录，因此使用持久盘用户目录 /data/home/firefly-blog，无需 sudo。
 
-正式成品分支仍为 `b790010a1e1cc2fe65fd094c436ae5d4cd8783f6`，公网仍运行 `7078bcb`，signature_verified=true、signing_key_id=f607ca43。尚未执行正式功能验收。
+上述预览结束时正式成品分支仍为 `b790010a1e1cc2fe65fd094c436ae5d4cd8783f6`，公网运行 `7078bcb`。随后用户另行授权一次手动正式发布，结果如下。
 
-后续顺序：检查签名预览 → 获准后手动 publish=true → 确认线上版本、公钥摘要和原有服务 → 开启自动构建 → 更新 Obsidian 正式运维笔记。不要把本次签名预览记为已经上线。
+### 首次手动正式发布
+
+[正式运行 40443435574](https://github.com/metaxora/Firefly-hyde/actions/runs/40443435574) 第 1 次尝试成功，输入 publish=true。源码 `d80dfe63dbf3bcc69aef04568c2039d06a35a2f8`，发布提交 `bc3dd2b6c6695b883b9b5e83930cc233495b07fc`。北京时间 2026-10-27 11:25:13，zero 已自动下载、验签并上线；公网 source_commit、deployment_commit、运行编号及重试次数匹配，signature_verified=true，signing_key_id=f607ca43。
+
+InstaBox 的 51 项测试、草稿筛除、Astro／TypeScript 检查和完整构建通过，生成 69 页、385 个文件，共 62,120,365 字节。本次远程检查、构建及官方下载校验为 229.93 秒；GitHub 全流程 11:18:28 至 11:23:13，共 4 分 45 秒。blog-dist-40443435574-1 artifact 保留 3 天；成品分支不会随 artifact 到期删除。
+
+公网 15 项核验通过。首页和文章仅多出 Cloudflare 注入的统计脚本及换行（367 字节），移除这段已识别注入后内容摘要匹配签名清单；图标、CSS、JS、Pagefind 代码与索引直接匹配。panel、status、wb、wb/v1、whale.js、whale.css 内容摘要与发布前一致；whale 目录保留既有 403。未修改 zero 的程序、timer、公钥、Nginx 或凭据；未通过 SSH 操作生产机。既有回退和清理机制沿用，本次未制造生产故障重复测试回退。
+
+本地部署记录及两份 Obsidian 运维笔记已更新。用户此次仅授权一次正式发布；INSTABOX_AUTO_BUILD_ENABLED 保持关闭，后续需另行明确启用后，main 提交才自动构建发布。暂停唤醒和独立冷／热缓存基准仍未额外实测。
 
 构建速度按实际唤醒、安装、检查、编译和传输耗时记录，不预设 2 秒或 3 秒。GitHub 等待远程构建期间仍计入 Actions 运行分钟。
 
