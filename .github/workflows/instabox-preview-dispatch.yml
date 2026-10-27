@@ -1,0 +1,41 @@
+name: Dispatch signed preview once
+
+on:
+  push:
+    branches: [migration/instabox]
+    paths: ['.github/workflows/instabox-preview-dispatch.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    if: github.repository == 'metaxora/Firefly-hyde' && contains(github.event.head_commit.message, '[instabox-preview-dispatch]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Start only a non-publishing main preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTO_BUILD_ENABLED: ${{ vars.INSTABOX_AUTO_BUILD_ENABLED }}
+        run: |
+          python3 - <<'PY'
+          import json,os,urllib.request
+          assert os.environ.get("AUTO_BUILD_ENABLED") != "true", "Automatic builds must remain disabled"
+          base="https://api.github.com/repos/metaxora/Firefly-hyde"
+          headers={"Authorization":"Bearer "+os.environ["GH_TOKEN"],"Accept":"application/vnd.github+json","User-Agent":"firefly-preview-dispatch"}
+          def get(path):
+              with urllib.request.urlopen(urllib.request.Request(base+path,headers=headers),timeout=30) as response:
+                  return json.load(response)
+          main=get("/git/ref/heads/main")["object"]["sha"]
+          assert main == "6c8f6b8226b119e6b6ff9588dbb25c272066afdc", "main changed; inspect before previewing"
+          print("Main source: "+main)
+          print("Unchanged production branch baseline: "+get("/git/ref/heads/blog-deploy")["object"]["sha"])
+          request=urllib.request.Request(base+"/actions/workflows/build.yml/dispatches",data=json.dumps({"ref":"main","inputs":{"publish":"false"}}).encode(),headers=dict(headers,**{"Content-Type":"application/json"}),method="POST")
+          with urllib.request.urlopen(request,timeout=30) as response:
+              assert response.status == 204
+          print("Dispatched build.yml on main with publish=false")
+          PY
