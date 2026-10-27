@@ -1,6 +1,6 @@
 # InstaBox 单仓库构建集成
 
-状态：第一阶段代码改造与测试；未合并 main、未更新 blog-deploy、未操作 zero。
+状态（2026-10-27）：代码已合并 main，真实构建及 publish=false 签名预览通过；尚未更新 blog-deploy，未操作 zero，自动构建保持关闭。
 
 ## 固定架构
 
@@ -55,9 +55,9 @@ GET /v1/machines/{id}/files/content?path=<绝对路径>
 
 手动试跑会保存额外的 `blog-signed-preview-<run>-<attempt>` artifact，内含 release.zip 与运行信息，同样保留 3 天；不会更新 blog-deploy。传输使用 tar.gz，签名预览 ZIP 仅用于验证原生产端的 GitHub archive 布局。
 
-## 后续需要的唯一新增 Secret
+## 已配置的凭据与发布开关
 
-在本仓库 Settings → Secrets and variables → Actions 中添加：
+在本仓库 Settings → Secrets and variables → Actions 中管理；两项 Secret 均已配置，值不记录在源码或运维笔记中：
 
 | 类型 | 名称 | 配置 |
 | --- | --- | --- |
@@ -71,11 +71,17 @@ GET /v1/machines/{id}/files/content?path=<绝对路径>
 f607ca4303c9f5f110fd872d37c5a0bb6beed1545d6553774c683add31bfc5bc
 ```
 
-## 验收与范围
+## 验收记录与后续范围
 
-第一阶段只在迁移分支改代码、运行 Linux CI、更新现有草稿 PR；不合并 main，不更新 blog-deploy，不登录 zero。覆盖大文件、真实 HTTP 下载、截断、中断、重定向、错误长度与摘要、恶意 tar、超时、取消、源码精确获取及原版生产解析器兼容。
+第一阶段的迁移分支改造与 Linux CI 已完成。测试覆盖大文件、真实 HTTP 下载、截断、中断、重定向、错误长度与摘要、恶意 tar、超时、取消、源码精确获取及原版生产解析器兼容。
 
-后续顺序：配置唯一新增 Secret → 在关闭自动构建的情况下安装工作流 → 手动 publish=false 真实试跑 → 检查签名预览 → 手动 publish=true → 确认线上版本、公钥摘要和原有服务 → 开启自动构建 → 更新正式运维笔记。
+用户随后明确授权合并并试跑，不发布正式网站。[PR #1](https://github.com/metaxora/Firefly-hyde/pull/1) 已合并，真实预览源码为 `6c8f6b8226b119e6b6ff9588dbb25c272066afdc`。[完整运行](https://github.com/metaxora/Firefly-hyde/actions/runs/40441528843) 第 2 次尝试成功：51 项 Python 测试、草稿筛除、Astro／TypeScript 检查与完整构建通过，生成 69 页；官方文件接口下载约 34 MB 成品后，在 GitHub 使用原 Secret 签名，原版 pull.py 的验签和解包函数通过。成品及签名预览 artifact 保存 3 天。
+
+首轮试跑遇到 InstaBox HTTP 502 后停止，签名跳过；重试成功。远程检查、构建与下载共 153.48 秒，成功尝试从启动至工作流完成共 246 秒。该次运行不能代替独立冷／热缓存对照；实际暂停唤醒尚未实测。[API 预检](https://github.com/metaxora/Firefly-hyde/actions/runs/40441312502) 已验证 2,097,169 字节二进制下载的长度与摘要。实机不能由普通用户直接写入 /data 根目录，因此使用持久盘用户目录 /data/home/firefly-blog，无需 sudo。
+
+正式成品分支仍为 `b790010a1e1cc2fe65fd094c436ae5d4cd8783f6`，公网仍运行 `7078bcb`，signature_verified=true、signing_key_id=f607ca43。尚未执行正式功能验收。
+
+后续顺序：检查签名预览 → 获准后手动 publish=true → 确认线上版本、公钥摘要和原有服务 → 开启自动构建 → 更新 Obsidian 正式运维笔记。不要把本次签名预览记为已经上线。
 
 构建速度按实际唤醒、安装、检查、编译和传输耗时记录，不预设 2 秒或 3 秒。GitHub 等待远程构建期间仍计入 Actions 运行分钟。
 

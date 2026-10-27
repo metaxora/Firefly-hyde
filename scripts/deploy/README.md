@@ -1,13 +1,13 @@
 # zero 自动发布
 
-InstaBox 单仓库构建集成见 [MIGRATION.md](MIGRATION.md)。新流程的手动运行默认仅保存签名预览、自动构建默认关闭；下文描述的是仍在运行的原 GitHub 构建流程，正式切换完成后再更新当前状态。
+InstaBox 单仓库构建集成见 [MIGRATION.md](MIGRATION.md)。代码已合并，真实构建及签名预览通过；手动运行默认仅保存签名预览，自动构建仍关闭，正式网站继续运行原签名版本，尚未切换。
 
 此部署针对公开仓库 `metaxora/Firefly-hyde` 和站点 `https://metaxora.com/`。
 
 ## 发布流程
 
-1. 提交 main 后，GitHub Actions 并行执行源代码检查和构建。
-2. 两个任务成功后，publish 任务用专用 Ed25519 私钥签署逐文件 SHA-256 清单，将静态文件、清单及 `deployment.sig` 写入 `blog-deploy` 分支。此分支是自动生成的，不要手动编辑；每次发布替换分支头，只保留当前发布快照。
+1. 手动运行 build.yml 可启动构建；提交 main 自动构建需变量 INSTABOX_AUTO_BUILD_ENABLED=true，目前未开启。GitHub 执行轻量部署检查，调度 InstaBox 完成锁文件依赖安装、部署测试、草稿筛除、Astro／TypeScript 检查和完整构建，再经官方文件接口下载、验证成品。
+2. 检查与构建成功后，publish 任务用专用 Ed25519 私钥签署逐文件 SHA-256 清单，并经原版生产解析器复验。手动 publish=false 只保存签名预览；publish=true 或启用自动构建后的 main 提交才将静态文件、清单及 `deployment.sig` 写入 `blog-deploy` 分支。此分支是自动生成的，不要手动编辑；每次发布替换分支头，只保留当前发布快照。
 3. zero 的 systemd timer 在上一次检查结束两分钟后再次检查，使用本机固定公钥验签，再确认对应 main 工作流成功、核对运行编号及重试次数、校验全部文件后切换 current。旧运行记录重放会被拒绝。
 4. 发布期间旧网站继续提供服务。新首页验证失败或原有面板、状态页、接口健康检查响应变化时自动恢复前一版。
 
