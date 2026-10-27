@@ -25,3 +25,19 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/draft-tests" --no-audit --no-fund --ignore-scripts gray-matter@4.0.3
           cp scripts/deploy/strip-drafts.mjs scripts/deploy/test-drafts.mjs "$RUNNER_TEMP/draft-tests/"
           node "$RUNNER_TEMP/draft-tests/test-drafts.mjs"
+
+  api-preflight:
+    name: Verify InstaBox API and binary file transfer
+    needs: test
+    if: github.repository == 'metaxora/Firefly-hyde' && github.ref == 'refs/heads/migration/instabox' && github.event_name == 'push' && contains(github.event.head_commit.message, '[instabox-preflight]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check machine and official file API without publishing
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          AUTO_BUILD_ENABLED: ${{ vars.INSTABOX_AUTO_BUILD_ENABLED }}
+        run: python3 -B scripts/deploy/instabox_preflight.py
