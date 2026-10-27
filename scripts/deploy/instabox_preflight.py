@@ -36,7 +36,13 @@ assert not any(p.is_symlink() for p in (base,probes,target))
 probes.mkdir(parents=True,exist_ok=True); target.mkdir()
 print(json.dumps({'architecture':platform.machine(),'cpus':os.cpu_count(),'node':subprocess.check_output(['node','--version'],text=True).strip(),'python':platform.python_version()}))
 """
-    print("Machine environment: " + client.execute(["python3", "-c", prepare, job]).strip(), flush=True)
+    environment = client.json("POST", "/exec", {"argv": ["python3", "-c", prepare, job], "timeoutSeconds": 60})
+    if (environment.get("exitCode") != 0 or environment.get("timedOut") is not False
+            or environment.get("truncated") is not False):
+        # This fixed diagnostic command cannot access any credentials.
+        print("Environment probe: " + json.dumps({name: environment.get(name) for name in ("exitCode", "timedOut", "truncated", "stdout", "stderr")})[:8192], flush=True)
+        raise RuntimeError("InstaBox environment probe failed")
+    print("Machine environment: " + environment["stdout"].strip(), flush=True)
     marker = b"firefly-instabox-api-preflight\n"
     try:
         client.upload(remote + "/marker.txt", marker)
