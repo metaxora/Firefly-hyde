@@ -94,6 +94,7 @@ class DeploymentChecks(unittest.TestCase):
             pull.BASE = original_base
 
 
+@unittest.skipIf(os.name == "nt", "Signing uses Linux /dev/stdin; full crypto checks run in Linux CI")
 class SignedManifestChecks(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
