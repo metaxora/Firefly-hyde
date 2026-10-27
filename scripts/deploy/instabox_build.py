@@ -13,7 +13,7 @@ import artifacts
 import build_config
 from instabox_api import Client
 
-REMOTE_BASE = "/data/firefly-blog"
+REMOTE_BASE = "/data/home/firefly-blog"
 
 
 def machine_state(info):

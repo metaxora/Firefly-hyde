@@ -24,7 +24,7 @@
 
 InstaBox：zero-forge，`m_agqxotxgzkyg7lawsooh5fr2hi`，免费版，4 核、8 GiB、20 GiB 数据盘；空闲 30 分钟暂停，单次最长 8 小时。
 
-固定 Node.js 22.23.3、pnpm 11.22.0。使用 `npx pnpm@11.22.0`，不改机器原有全局 pnpm。源码通过匿名 HTTPS 缓存在 `/data/firefly-blog/repository.git`，按本次完整 SHA 获取，避免误编译较新的分支头。任务独立放在 jobs/<run>-<attempt>，不覆盖预览目录；依赖缓存单独保留。
+固定 Node.js 22.23.3、pnpm 11.22.0。使用 `npx pnpm@11.22.0`，不改机器原有全局 pnpm。源码通过匿名 HTTPS 缓存在 `/data/home/firefly-blog/repository.git`，按本次完整 SHA 获取，避免误编译较新的分支头。任务独立放在 jobs/<run>-<attempt>，不覆盖预览目录；依赖缓存单独保留。
 
 任务串行并持有机器级锁。远端进程组有独立 24 分钟硬超时，GitHub 构建作业上限 30 分钟。取消时仅尝试终止本次任务进程组；运行中的任务和未知目录不清理，超过一小时的已停止任务由后续构建清理。
 

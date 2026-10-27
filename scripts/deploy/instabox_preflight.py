@@ -27,11 +27,11 @@ def main():
     started = time.monotonic()
     ensure_running(client, started + 180)
     job = str(build_config.positive(os.environ["GITHUB_RUN_ID"])) + "-" + str(build_config.positive(os.environ["GITHUB_RUN_ATTEMPT"]))
-    remote = "/data/firefly-blog/api-probes/" + job
+    remote = "/data/home/firefly-blog/api-probes/" + job
     prepare = """import json,os,platform,subprocess,sys
 from pathlib import Path
 os.umask(0o077)
-base=Path('/data/firefly-blog'); probes=base/'api-probes'; target=probes/sys.argv[1]
+base=Path('/data/home/firefly-blog'); probes=base/'api-probes'; target=probes/sys.argv[1]
 assert not any(p.is_symlink() for p in (base,probes,target))
 probes.mkdir(parents=True,exist_ok=True); target.mkdir()
 print(json.dumps({'architecture':platform.machine(),'cpus':os.cpu_count(),'node':subprocess.check_output(['node','--version'],text=True).strip(),'python':platform.python_version()}))
@@ -65,7 +65,7 @@ print(json.dumps({'size':len(data),'sha256':hashlib.sha256(data).hexdigest()}))
     finally:
         cleanup = """from pathlib import Path
 import sys
-p=Path('/data/firefly-blog/api-probes')/sys.argv[1]
+p=Path('/data/home/firefly-blog/api-probes')/sys.argv[1]
 assert not p.is_symlink()
 for name in ('marker.txt','probe.bin'): (p/name).unlink(missing_ok=True)
 p.rmdir()

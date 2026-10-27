@@ -13,7 +13,7 @@ import sys
 import tarfile
 import time
 
-BASE = Path("/data/firefly-blog")
+BASE = Path("/data/home/firefly-blog")
 REPOSITORY = "metaxora/Firefly-hyde"
 
 

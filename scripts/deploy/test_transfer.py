@@ -59,7 +59,7 @@ class BinaryTransferChecks(unittest.TestCase):
         response = response if response is not None else Response(data)
         opener = Opener(response, error)
         client = Client("m_test", "test-key", opener=opener)
-        client.download("/data/firefly-blog/jobs/300-1/dist.tar.gz", self.destination,
+        client.download("/data/home/firefly-blog/jobs/300-1/dist.tar.gz", self.destination,
                         len(data) if size is None else size,
                         hashlib.sha256(data).hexdigest() if checksum is None else checksum)
         return opener, response
@@ -82,7 +82,7 @@ class BinaryTransferChecks(unittest.TestCase):
         self.assertEqual(url.scheme, "https")
         self.assertEqual(url.hostname, "api.instabox.sh")
         self.assertEqual(url.path, "/v1/machines/m_test/files/content")
-        self.assertEqual(urllib.parse.parse_qs(url.query)["path"], ["/data/firefly-blog/jobs/300-1/dist.tar.gz"])
+        self.assertEqual(urllib.parse.parse_qs(url.query)["path"], ["/data/home/firefly-blog/jobs/300-1/dist.tar.gz"])
         self.assertNotIn("test-key", request.full_url)
         self.assertEqual(len(opener.requests), 1)  # No exec or Base64 fallback.
 
@@ -168,7 +168,7 @@ class ControlApiChecks(unittest.TestCase):
         metadata = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         opener = Opener(Response(json.dumps(metadata).encode(), status=201))
         client = Client("m_test", "test-key", opener=opener)
-        client.upload("/data/firefly-blog/jobs/300-1/remote_build.py", data)
+        client.upload("/data/home/firefly-blog/jobs/300-1/remote_build.py", data)
         request = opener.requests[0]
         self.assertEqual(request.method, "PUT")
         self.assertEqual(urllib.parse.urlsplit(request.full_url).path, "/v1/machines/m_test/files")
